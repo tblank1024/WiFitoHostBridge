@@ -1,0 +1,24 @@
+[Unit]
+Description=WiFi Bridge Listener Service (NetworkManager)
+# Wait until the network stack is fully configured and online
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# --- IMPORTANT: Modify the lines below ---
+# User: Must run as root to use nmcli for network changes
+User=tblank
+# WorkingDirectory: The absolute path to the directory containing RPZero2WListener.py
+WorkingDirectory=/home/tblank/code/tblank1024/WiFitoHostBridge
+ExecStart=/usr/bin/python3 /home/tblank/code/tblank1024/WiFitoHostBridge/RPZero2WListener.py
+# --- End of modifications ---
+
+# Restart the service if it fails
+Restart=on-failure
+RestartSec=5
+
+[Install]
+# Start the service during the multi-user boot target
+WantedBy=multi-user.target
+
