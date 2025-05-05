@@ -21,9 +21,11 @@ Usage:
 1. Ensure the Pi Zero W has an initial network connection (e.g., Ethernet) so this script
    can listen for commands.
 2. Ensure NetworkManager is managing the network interfaces (default on Bookworm).
-3. Run the script on the Pi Zero W using sudo:
-   sudo python3 host-bridge.py
-4. From the RP5 (or another machine), run the client script (pi2w-bridge.py) to send
+3. Use the setup_services.sh script to install the script to /usr/local/sbin and set up
+   the systemd service (wifi-bridge-listener.service) to run it automatically on boot as root.
+4. If running manually for testing:
+   sudo python3 /usr/local/sbin/RPZero2WListener.py
+5. From the RP5 (or another machine), run the client script (ControltoRPZero2W.py) to send
    the desired WiFi SSID and password to the IP address and port this script is listening on.
 
 Expected Output (on Pi Zero W console):
@@ -72,19 +74,25 @@ def run_command(command, suppress_stderr=False):
             timeout=20  # Add a timeout for safety
         )
         print(f"Command stdout:\n{result.stdout.strip()}")
+        # Only print stderr if not suppressed AND if it contains something
         if result.stderr and not suppress_stderr:
-            # nmcli often prints status messages to stderr, only show if not suppressed
             print(f"Command stderr:\n{result.stderr.strip()}")
         return result.stdout.strip()
     except subprocess.CalledProcessError as e:
         # Log detailed error including stdout/stderr from the failed command
-        print(f"Error running command '{' '.join(command)}'. Return code: {e.returncode}")
-        print(f"Stdout: {e.stdout.strip()}")
-        print(f"Stderr: {e.stderr.strip()}")
+        # ALWAYS print stderr on error, regardless of suppress_stderr flag
+        print(f"ERROR running command '{' '.join(command)}'. Return code: {e.returncode}")
+        print(f"--> Stdout: {e.stdout.strip()}")
+        print(f"--> Stderr: {e.stderr.strip()}") # Ensure stderr is printed on error
         # Re-raise the error to be caught by the calling function
         raise
-    except subprocess.TimeoutExpired:
+    except subprocess.TimeoutExpired as e: # Capture the exception object
         print(f"Timeout running command '{' '.join(command)}'")
+        # Log stdout/stderr if available on timeout
+        if e.stdout:
+            print(f"--> Stdout (on timeout): {e.stdout.strip()}")
+        if e.stderr:
+            print(f"--> Stderr (on timeout): {e.stderr.strip()}")
         raise
     except Exception as e:
         print(f"Unexpected error running command '{' '.join(command)}': {e}")
@@ -146,11 +154,13 @@ def add_nm_wifi_connection(ssid, password):
         "wifi-sec.psk", password
     ]
     try:
+        # run_command already prints detailed errors, including stderr on failure
         run_command(command)
         print(f"Successfully added connection profile: {ssid}")
         return True
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired, Exception) as e:
-        print(f"Failed to add connection profile {ssid}: {e}")
+        # Error is already printed by run_command, just log the higher-level failure
+        print(f"Failed to add connection profile '{ssid}' due to command error.")
         return False
 
 def activate_nm_connection(ssid):
@@ -356,10 +366,11 @@ def start_listener(host, port):
 
 
 if __name__ == "__main__":
+    # The service file should run this as root. This check is mainly for manual execution.
     if os.geteuid() != 0:
         print("Warning: Script not running as root (sudo). NetworkManager commands will fail.")
         # import sys
-        # print("Please run this script using 'sudo python3 host-bridge.py'")
-        # sys.exit(1)
+        # print("Please run this script using 'sudo python3 /usr/local/sbin/RPZero2WListener.py'")
+        # sys.exit(1) # Optional: exit if not root when run manually
 
     start_listener(HOST, PORT)
