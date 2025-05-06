@@ -2,17 +2,13 @@ import socket
 import time
 import sys # Import sys module for command-line arguments
 
-def send_wifi_config(host, port, ssid, password, retries=3, delay=5):
+def send_wifi_config(host, port, ssid, password, profile_name=None, retries=3, delay=5):
     """
     Sends a special packet to the bridge program to configure WiFi.
-
-    Args:
-        host (str): The IP address or hostname of the Raspberry Pi.
-        port (int): The port number the bridge program is listening on.
-        ssid (str): The WiFi SSID to configure.
-        password (str): The WiFi password to configure.
-        retries (int): Number of retries if the connection fails.
-        delay (int): Delay (in seconds) between retries.
+    Returns an exit code:
+        0: WiFi connected and new SSID/PW installed.
+        1: Any general failure (e.g., connection to listener, invalid packet, server error).
+        100: WiFi didn't connect but SSID/PW were updated/profile modified.
     """
     client_socket = None # Initialize client_socket
     for attempt in range(1, retries + 1):
@@ -27,17 +23,30 @@ def send_wifi_config(host, port, ssid, password, retries=3, delay=5):
             print(f"Connected to {host}:{port}")
 
             # Create the special packet
-            packet = f"SET_WIFI,{ssid},{password}"
+            if profile_name:
+                packet = f"SET_WIFI_PROFILE,{ssid},{password},{profile_name}"
+                print(f"Sent packet: SET_WIFI_PROFILE,{ssid},<password_hidden>,{profile_name}")
+            else:
+                packet = f"SET_WIFI,{ssid},{password}"
+                print(f"Sent packet: SET_WIFI,{ssid},<password_hidden>")
 
             # Send the packet
             client_socket.sendall(packet.encode('utf-8'))
-            print(f"Sent packet: SET_WIFI,{ssid},<password_hidden>") # Avoid printing password
 
             # Receive the response
             response = client_socket.recv(1024).decode('utf-8')
             print(f"Received response: {response}")
-            return  # Exit function if successful
 
+            # Determine exit code based on response
+            if response == "WiFi connection successful":
+                return 0
+            elif "Error: Failed to activate NM connection" in response or \
+                 "WiFi connection failed: Timeout or connection error" in response:
+                # These imply the profile was likely added/modified, but activation/connection failed
+                return 100
+            else:
+                # All other errors from listener, or unexpected responses
+                return 1
         except socket.timeout:
              print(f"Attempt {attempt} failed: Connection or receive timed out.")
         except socket.error as e:
@@ -56,57 +65,94 @@ def send_wifi_config(host, port, ssid, password, retries=3, delay=5):
             time.sleep(delay)
         else:
             print("All attempts failed. Please check the connection and try again.")
+            return 1 # General failure if all retries fail
 
-    # Ensure socket is closed if loop finishes without success
+    # Ensure socket is closed if loop finishes without success (should be caught by return 1 above)
     if client_socket:
         client_socket.close()
+    return 1 # Default to general failure if something unexpected happens
 
 
 if __name__ == "__main__":
     # Configuration parameters
     RPI_HOST = '10.10.0.1' # Default host IP
     RPI_PORT = 12345      # Default host port
+    exit_code = 1         # Default to general failure
 
     # Check for command-line arguments
     if len(sys.argv) == 3:
-        # Use arguments: script_name ssid password
+        # Use arguments: script_name ssid password (uses default profile on listener)
         cli_ssid = sys.argv[1]
         cli_password = sys.argv[2]
-        print(f"Using command-line arguments: SSID='{cli_ssid}', Password=<hidden>")
-        send_wifi_config(RPI_HOST, RPI_PORT, cli_ssid, cli_password)
+        print(f"Using command-line arguments: SSID='{cli_ssid}', Password=<hidden>, Profile=Default")
+        exit_code = send_wifi_config(RPI_HOST, RPI_PORT, cli_ssid, cli_password)
+        print("Command-line execution finished.")
+    elif len(sys.argv) == 4:
+        # Use arguments: script_name ssid password profile_name
+        cli_ssid = sys.argv[1]
+        cli_password = sys.argv[2]
+        cli_profile = sys.argv[3]
+        print(f"Using command-line arguments: SSID='{cli_ssid}', Password=<hidden>, Profile='{cli_profile}'")
+        exit_code = send_wifi_config(RPI_HOST, RPI_PORT, cli_ssid, cli_password, profile_name=cli_profile)
         print("Command-line execution finished.")
     elif len(sys.argv) == 1:
         # No arguments provided, run the interactive loop
         print("No command-line arguments provided. Starting interactive mode.")
         while True:
-            tmp = input("1 for Guest, 2 for Home, 3 to exit: ")
+            tmp = input("1 for Guest, 2 for Home, 3 to exit, 4 for Custom Profile: ")
+            profile_name_interactive = None # Default
+            run_send = True
             if tmp == '1':
-                print("Decher WiFi configuration selected")
-                # Update with correct Guest SSID/Password if needed
-                WIFI_SSID = 'Decher&BlankGuests' # Example - Use actual SSID
-                WIFI_PASSWORD = 'xxx' # Example - Use actual Password
+                print("Decher WiFi configuration selected (Default Profile)")
+                WIFI_SSID = 'Decher&BlankGuests'
+                WIFI_PASSWORD = 'xxx'
             elif tmp == '2':
-                print("Home WiFi configuration selected")
+                print("Home WiFi configuration selected (Default Profile)")
                 WIFI_SSID = 'Buckley Clan 2'
                 WIFI_PASSWORD = 'xxx'
             elif tmp == '3':
                 print("Exiting interactive mode...")
+                run_send = False
+                exit_code = 0 # Successful exit from interactive mode choice
                 break
+            elif tmp == '4':
+                print("Custom Profile WiFi configuration selected")
+                WIFI_SSID = input("Enter SSID: ")
+                WIFI_PASSWORD = input("Enter Password: ")
+                profile_name_interactive = input("Enter Profile Name (or leave blank for listener's default): ").strip()
+                if not profile_name_interactive:
+                    profile_name_interactive = None
             else:
-                print("Invalid choice. Please enter 1, 2, or 3.")
-                continue # Ask again
+                print("Invalid choice. Please enter 1, 2, 3, or 4.")
+                run_send = False
+                continue
 
-            # Send the WiFi configuration packet
-            print(f"\nSending configuration for SSID: {WIFI_SSID}")
-            send_wifi_config(RPI_HOST, RPI_PORT, WIFI_SSID, WIFI_PASSWORD)
-            print("-" * 20) # Separator for clarity
+            if run_send:
+                # Send the WiFi configuration packet
+                if profile_name_interactive:
+                    print(f"\nSending configuration for SSID: {WIFI_SSID} with Profile: {profile_name_interactive}")
+                else:
+                    print(f"\nSending configuration for SSID: {WIFI_SSID} (Default Profile)")
+                current_exit_code = send_wifi_config(RPI_HOST, RPI_PORT, WIFI_SSID, WIFI_PASSWORD, profile_name=profile_name_interactive)
+                print(f"Operation resulted in exit code: {current_exit_code}")
+                print("-" * 20) # Separator for clarity
+                # In interactive mode, we might not want to exit immediately,
+                # but the last operation's code could be considered the overall status if we exited here.
+                # For now, just print and continue loop.
         print("Interactive mode finished.")
+        # If exiting interactive mode via option '3', exit_code is 0.
+        # Otherwise, the last operation's code isn't directly used for sys.exit here.
+        # This part might need refinement if a specific exit code is desired after interactive loop.
+        # For now, if interactive mode finishes, we'll use the last set exit_code (which is 0 if exited via '3').
     else:
         # Incorrect number of arguments
         print("Usage:")
         print(f"  Interactive mode: python {sys.argv[0]}")
-        print(f"  Command-line mode: python {sys.argv[0]} <SSID> <Password>")
-        print("Note: If SSID or Password contain spaces, enclose them in quotes.")
+        print(f"  Command-line (default profile): python {sys.argv[0]} <SSID> <Password>")
+        print(f"  Command-line (custom profile):  python {sys.argv[0]} <SSID> <Password> <ProfileName>")
+        print("Note: If SSID, Password or ProfileName contain spaces, enclose them in quotes.")
+        exit_code = 1 # General failure due to incorrect usage
 
-    print("Done.")
+    print(f"Done. Exiting with code {exit_code}.")
+    sys.exit(exit_code)
 
