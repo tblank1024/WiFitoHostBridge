@@ -150,16 +150,26 @@ def add_nm_wifi_connection(profile_name, ssid, password):
         return False
 
 def activate_nm_connection(profile_name):
-    """Attempts to activate (bring up) a NetworkManager connection by profile name."""
+    """
+    Attempts to activate (bring up) a NetworkManager connection by profile name.
+    Returns a tuple: (bool_success, error_type_string_or_None)
+    error_type_string can be "bad_password" or None.
+    """
     print(f"Attempting to activate connection: {profile_name}...")
     command = ["nmcli", "connection", "up", profile_name]
     try:
         run_command(command, suppress_stderr=True)
         print(f"Successfully initiated connection activation for: {profile_name}")
-        return True
+        return True, None
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired, Exception) as e:
         print(f"Failed to activate connection {profile_name}: {e}")
-        return False
+        if isinstance(e, subprocess.CalledProcessError) and e.stderr:
+            if "secrets were required" in e.stderr.lower():
+                print("Activation failed likely due to incorrect password.")
+                return False, "bad_password"
+            elif "connection profile is not valid" in e.stderr.lower():
+                print("Activation failed likely due to invalid profile configuration.")
+        return False, None
 
 def check_nm_connection_status(target_ssid, profile_name_to_check, timeout):
     """Checks if the WiFi interface is connected via NetworkManager using the specific profile and to the target SSID."""
@@ -288,8 +298,12 @@ def start_listener(host, port):
                     time.sleep(1) # Small delay before activating
 
                     # 3. Activate the determined connection profile
-                    if not activate_nm_connection(profile_to_use):
-                        response_message = b"Error: Failed to activate NM connection (check password?)"
+                    activation_success, activation_error_type = activate_nm_connection(profile_to_use)
+                    if not activation_success:
+                        if activation_error_type == "bad_password":
+                            response_message = b"Error: Activation failed - bad password?"
+                        else:
+                            response_message = b"Error: Failed to activate NM connection command"
                         final_status = f"failed: activation command rejected for '{profile_to_use}'"
                         raise ConnectionAbortedError("NM activate failed")
 

@@ -7,8 +7,10 @@ def send_wifi_config(host, port, ssid, password, profile_name=None, retries=3, d
     Sends a special packet to the bridge program to configure WiFi.
     Returns an exit code:
         0: WiFi connected and new SSID/PW installed.
-        1: Any general failure (e.g., connection to listener, invalid packet, server error).
-        100: WiFi didn't connect but SSID/PW were updated/profile modified.
+        1: Any general failure (e.g., connection to listener, invalid packet, server error, profile add failure).
+        100: Activation failed (likely bad password), but SSID/PW were updated/profile modified.
+        101: WiFi didn't connect after activation attempt (e.g. bad/unreachable SSID, timeout),
+             but SSID/PW were updated/profile modified.
     """
     client_socket = None # Initialize client_socket
     for attempt in range(1, retries + 1):
@@ -40,12 +42,16 @@ def send_wifi_config(host, port, ssid, password, profile_name=None, retries=3, d
             # Determine exit code based on response
             if response == "WiFi connection successful":
                 return 0
-            elif "Error: Failed to activate NM connection" in response or \
-                 "WiFi connection failed: Timeout or connection error" in response:
-                # These imply the profile was likely added/modified, but activation/connection failed
-                return 100
+            elif "Error: Activation failed - bad password?" in response:
+                return 100 # Profile updated, but activation failed due to likely bad password
+            elif "WiFi connection failed: Timeout or connection error" in response:
+                # Profile updated, activation command likely succeeded, but final connection check failed
+                return 101
+            elif "Error: Failed to activate NM connection command" in response:
+                # Profile updated, but activation command itself failed for other reasons
+                return 1 # Treat as a more general failure if not specifically bad password
             else:
-                # All other errors from listener, or unexpected responses
+                # All other errors from listener (e.g., profile add failure, invalid packet), or unexpected responses
                 return 1
         except socket.timeout:
              print(f"Attempt {attempt} failed: Connection or receive timed out.")
@@ -99,51 +105,22 @@ if __name__ == "__main__":
         # No arguments provided, run the interactive loop
         print("No command-line arguments provided. Starting interactive mode.")
         while True:
-            tmp = input("1 for Guest, 2 for Home, 3 to exit, 4 for Custom Profile: ")
+            print("\nInteractive Mode: ^C to exit")
             profile_name_interactive = None # Default
-            run_send = True
-            if tmp == '1':
-                print("Decher WiFi configuration selected (Default Profile)")
-                WIFI_SSID = 'Decher&BlankGuests'
-                WIFI_PASSWORD = 'xxx'
-            elif tmp == '2':
-                print("Home WiFi configuration selected (Default Profile)")
-                WIFI_SSID = 'Buckley Clan 2'
-                WIFI_PASSWORD = 'xxx'
-            elif tmp == '3':
-                print("Exiting interactive mode...")
-                run_send = False
-                exit_code = 0 # Successful exit from interactive mode choice
-                break
-            elif tmp == '4':
-                print("Custom Profile WiFi configuration selected")
-                WIFI_SSID = input("Enter SSID: ")
-                WIFI_PASSWORD = input("Enter Password: ")
-                profile_name_interactive = input("Enter Profile Name (or leave blank for listener's default): ").strip()
-                if not profile_name_interactive:
-                    profile_name_interactive = None
+            WIFI_SSID = input("Enter SSID: ")
+            WIFI_PASSWORD = input("Enter Password: ")
+            Profile = input("Enter Profile Name (or leave blank for default): ")
+            if Profile.strip():
+                profile_name_interactive = Profile.strip()
+            # Send the WiFi configuration packet
+            if profile_name_interactive:
+                print(f"\nSending configuration for SSID: {WIFI_SSID} with Profile: {profile_name_interactive}")
             else:
-                print("Invalid choice. Please enter 1, 2, 3, or 4.")
-                run_send = False
-                continue
-
-            if run_send:
-                # Send the WiFi configuration packet
-                if profile_name_interactive:
-                    print(f"\nSending configuration for SSID: {WIFI_SSID} with Profile: {profile_name_interactive}")
-                else:
-                    print(f"\nSending configuration for SSID: {WIFI_SSID} (Default Profile)")
-                current_exit_code = send_wifi_config(RPI_HOST, RPI_PORT, WIFI_SSID, WIFI_PASSWORD, profile_name=profile_name_interactive)
-                print(f"Operation resulted in exit code: {current_exit_code}")
-                print("-" * 20) # Separator for clarity
-                # In interactive mode, we might not want to exit immediately,
-                # but the last operation's code could be considered the overall status if we exited here.
-                # For now, just print and continue loop.
-        print("Interactive mode finished.")
-        # If exiting interactive mode via option '3', exit_code is 0.
-        # Otherwise, the last operation's code isn't directly used for sys.exit here.
-        # This part might need refinement if a specific exit code is desired after interactive loop.
-        # For now, if interactive mode finishes, we'll use the last set exit_code (which is 0 if exited via '3').
+                print(f"\nSending configuration for SSID: {WIFI_SSID} (Default Profile)")
+            current_exit_code = send_wifi_config(RPI_HOST, RPI_PORT, WIFI_SSID, WIFI_PASSWORD, profile_name=profile_name_interactive)
+            print(f"Operation resulted in exit code: {current_exit_code}")
+            print("-" * 20) # Separator for clarity
+            # Loop continues until Ctrl+C
     else:
         # Incorrect number of arguments
         print("Usage:")
