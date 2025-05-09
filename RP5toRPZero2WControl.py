@@ -104,23 +104,30 @@ if __name__ == "__main__":
     elif len(sys.argv) == 1:
         # No arguments provided, run the interactive loop
         print("No command-line arguments provided. Starting interactive mode.")
-        while True:
-            print("\nInteractive Mode: ^C to exit")
-            profile_name_interactive = None # Default
-            WIFI_SSID = input("Enter SSID: ")
-            WIFI_PASSWORD = input("Enter Password: ")
-            Profile = input("Enter Profile Name (or leave blank for default): ")
-            if Profile.strip():
-                profile_name_interactive = Profile.strip()
-            # Send the WiFi configuration packet
-            if profile_name_interactive:
-                print(f"\nSending configuration for SSID: {WIFI_SSID} with Profile: {profile_name_interactive}")
-            else:
-                print(f"\nSending configuration for SSID: {WIFI_SSID} (Default Profile)")
-            current_exit_code = send_wifi_config(RPI_HOST, RPI_PORT, WIFI_SSID, WIFI_PASSWORD, profile_name=profile_name_interactive)
-            print(f"Operation resulted in exit code: {current_exit_code}")
-            print("-" * 20) # Separator for clarity
-            # Loop continues until Ctrl+C
+        try:
+            while True:
+                print("\nInteractive Mode: ^C to exit")
+                profile_name_interactive = None # Default
+                WIFI_SSID = input("Enter SSID: ")
+                WIFI_PASSWORD = input("Enter Password: ")
+                Profile = input("Enter Profile Name (or leave blank for default): ")
+                if Profile.strip():
+                    profile_name_interactive = Profile.strip()
+                # Send the WiFi configuration packet
+                if profile_name_interactive:
+                    print(f"\nSending configuration for SSID: {WIFI_SSID} with Profile: {profile_name_interactive}")
+                else:
+                    print(f"\nSending configuration for SSID: {WIFI_SSID} (Default Profile)")
+                current_exit_code = send_wifi_config(RPI_HOST, RPI_PORT, WIFI_SSID, WIFI_PASSWORD, profile_name=profile_name_interactive)
+                print(f"Operation resulted in exit code: {current_exit_code}")
+                print("-" * 20) # Separator for clarity
+                # Loop continues until Ctrl+C
+        except KeyboardInterrupt:
+            print("\nInteractive mode terminated by user (^C).")
+            exit_code = 0 # Graceful exit
+        except EOFError: # Handle EOF (e.g., if input is piped and ends)
+            print("\nEnd of input reached. Exiting interactive mode.")
+            exit_code = 0 # Graceful exit
     else:
         # Incorrect number of arguments
         print("Usage:")
