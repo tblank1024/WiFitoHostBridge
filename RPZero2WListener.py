@@ -45,6 +45,19 @@ WiFi connection successful.
 Expected Response Sent to Client:
 ---------------------------------
 b'WiFi connection successful' or b'WiFi connection failed: <reason>'
+
+Viewing Logs:
+-------------
+The script uses `print()` statements for logging.
+- If running the script directly from a terminal (e.g., `sudo python3 RPZero2WListener.py`):
+  The output (logs) will be displayed directly in your terminal.
+- If running as the systemd service (`wifi-bridge-listener.service`):
+  Logs are managed by journald. You can view them using `journalctl`.
+  Common commands:
+    - `sudo journalctl -u wifi-bridge-listener.service` (to see all logs for the service)
+    - `sudo journalctl -u wifi-bridge-listener.service -f` (to follow new logs in real-time)
+    - `sudo journalctl -u wifi-bridge-listener.service --since "1 hour ago"` (to see logs from the last hour)
+    - `sudo journalctl -u wifi-bridge-listener.service -n 100` (to see the last 100 log lines)
 """
 
 import socket
@@ -54,6 +67,7 @@ import os
 import re
 
 # --- Configuration ---
+SCRIPT_VERSION = "1.0.9"
 HOST = "10.10.0.1"  # Listen only on this specific IP address
 PORT = 12345
 WIFI_INTERFACE = "wlan0" # Ensure this matches your WiFi interface name
@@ -177,16 +191,18 @@ def check_nm_connection_status(target_ssid, profile_name_to_check, timeout):
     start_time = time.time()
     attempt = 0
     connected = False
-    ip_address = "Not found"
+    # ip_address will be initialized inside the loop
 
     while time.time() - start_time < timeout:
         attempt += 1
+        # Initialize status variables for each attempt
         device_state = "unknown"
         active_profile_name = "None"
         active_ssid = "None"
-        ip_address = "Not found"
+        ip_address = "Not found" # Crucial to reset this each loop
 
         try:
+            # 1. Check Device State (e.g., wlan0)
             dev_status_result = subprocess.run(
                 ["nmcli", "-t", "-f", "DEVICE,STATE", "device", "status"],
                 capture_output=True, text=True, check=False, timeout=5
@@ -194,26 +210,67 @@ def check_nm_connection_status(target_ssid, profile_name_to_check, timeout):
             if dev_status_result.returncode == 0:
                  for line in dev_status_result.stdout.strip().split('\n'):
                     if line.startswith(f"{WIFI_INTERFACE}:"):
-                        device_state = line.split(':')[1]
+                        try:
+                            device_state = line.split(':', 1)[1]
+                        except IndexError:
+                            print(f"Warning: Could not parse device state from line: {line}")
                         break
+            else:
+                print(f"DEBUG: 'nmcli device status' command failed. Code: {dev_status_result.returncode}")
+                if dev_status_result.stderr:
+                    print(f"DEBUG: 'nmcli device status' stderr:\n{dev_status_result.stderr.strip()}")
 
+            # 2. Get Active Connection Profile Name for the WiFi interface
+            active_conn_cmd = ["nmcli", "-t", "-f", "NAME,DEVICE", "connection", "show", "--active"]
             active_conn_result = subprocess.run(
-                ["nmcli", "-t", "-f", "NAME,DEVICE,ACTIVE-SSID", "connection", "show", "--active"],
+                active_conn_cmd,
                  capture_output=True, text=True, check=False, timeout=5
             )
             if active_conn_result.returncode == 0:
+                # print(f"DEBUG: '{' '.join(active_conn_cmd)}' output:\n{active_conn_result.stdout.strip()}")
                 for line in active_conn_result.stdout.strip().split('\n'):
                      if not line: continue
                      try:
-                         parts = line.split(':')
-                         if len(parts) >= 2 and parts[1] == WIFI_INTERFACE:
+                         parts = line.split(':', 1) # NAME:DEVICE
+                         if len(parts) == 2 and parts[1] == WIFI_INTERFACE:
                              active_profile_name = parts[0]
-                             if len(parts) >= 3:
-                                 active_ssid = parts[2]
                              break
-                     except ValueError:
+                     except Exception as e:
+                         print(f"Warning: Error parsing active connection line: {line} - {e}")
                          continue
+            else:
+                print(f"DEBUG: '{' '.join(active_conn_cmd)}' command failed. Code: {active_conn_result.returncode}")
+                if active_conn_result.stderr:
+                    print(f"DEBUG: '{' '.join(active_conn_cmd)}' stderr:\n{active_conn_result.stderr.strip()}")
 
+            # 3. Get Currently Connected SSID for the WiFi interface
+            # Only try to get SSID if device is in a state that might have an SSID
+            if device_state not in ["disconnected", "unavailable", "deactivating", "unknown"]:
+                ssid_cmd = ["nmcli", "-t", "-f", "active,ssid", "device", "wifi", "list", "ifname", WIFI_INTERFACE, "--rescan", "no"]
+                ssid_result = subprocess.run(
+                    ssid_cmd,
+                    capture_output=True, text=True, check=False, timeout=5
+                )
+                if ssid_result.returncode == 0:
+                    # print(f"DEBUG: '{' '.join(ssid_cmd)}' output:\n{ssid_result.stdout.strip()}")
+                    for line in ssid_result.stdout.strip().split('\n'):
+                        if not line: continue
+                        try:
+                            parts = line.split(':', 1) # active:ssid (e.g., yes:MyNetwork)
+                            if len(parts) == 2 and parts[0] == "yes":
+                                active_ssid = parts[1]
+                                break
+                        except Exception as e:
+                            print(f"Warning: Error parsing SSID list line: {line} - {e}")
+                            continue
+                else:
+                    # This command might fail if wifi is disabled or interface not found, which is not necessarily an error for the check logic
+                    print(f"DEBUG: '{' '.join(ssid_cmd)}' command failed or returned no active SSID. Code: {ssid_result.returncode}")
+                    if ssid_result.stderr:
+                        print(f"DEBUG: '{' '.join(ssid_cmd)}' stderr:\n{ssid_result.stderr.strip()}")
+
+
+            # 4. If device seems connected to the right profile/SSID, check for IP Address
             if device_state == "connected" and active_profile_name == profile_name_to_check and active_ssid == target_ssid:
                 ip_output_result = subprocess.run(
                     ["ip", "-4", "addr", "show", WIFI_INTERFACE],
@@ -223,26 +280,49 @@ def check_nm_connection_status(target_ssid, profile_name_to_check, timeout):
                     ip_match = re.search(r"inet (\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})", ip_output_result.stdout)
                     if ip_match:
                         ip_address = ip_match.group(1)
+                else:
+                    print(f"DEBUG: 'ip addr show {WIFI_INTERFACE}' command failed. Code: {ip_output_result.returncode}")
+                    if ip_output_result.stderr:
+                        print(f"DEBUG: 'ip addr show {WIFI_INTERFACE}' stderr:\n{ip_output_result.stderr.strip()}")
+
 
             print(f"Connection check attempt {attempt}: Device State={device_state}, Active Profile='{active_profile_name}', Active SSID='{active_ssid}', IP={ip_address}")
 
-            if device_state == "connected" and active_profile_name == profile_name_to_check and active_ssid == target_ssid and ip_address != "Not found":
+            # 5. Check for successful connection based on all criteria
+            if device_state == "connected" and \
+               active_profile_name == profile_name_to_check and \
+               active_ssid == target_ssid and \
+               ip_address != "Not found":
                 print(f"Success criteria met: State={device_state}, Profile matches '{profile_name_to_check}', SSID matches '{target_ssid}', IP found ({ip_address})")
                 connected = True
-                break
-            elif device_state == "disconnected":
-                 print("Device is disconnected. Waiting...")
-            elif device_state == "connecting":
-                 print("Device is connecting. Waiting...")
-            elif device_state == "connected" and active_profile_name != profile_name_to_check:
-                 print(f"Device connected but wrong profile active ('{active_profile_name}'). Waiting for '{profile_name_to_check}'...")
-            elif device_state == "connected" and active_profile_name == profile_name_to_check and active_ssid != target_ssid:
-                 print(f"Device connected with correct profile but wrong SSID ('{active_ssid}'). Waiting for '{target_ssid}'...")
+                break # Exit the while loop
 
+            # Provide more detailed feedback if not yet connected
+            elif device_state in ["disconnected", "unavailable", "deactivating"]:
+                 print(f"Device is {device_state}. Waiting...")
+            elif device_state in ["connecting", "activating", "preparing"]: # Common NM states during connection
+                 print(f"Device is {device_state}. Waiting...")
+            elif device_state == "connected": # Connected, but other criteria not met
+                if active_profile_name != profile_name_to_check:
+                    print(f"Device connected but wrong profile active ('{active_profile_name}' vs '{profile_name_to_check}'). Waiting...")
+                elif active_ssid != target_ssid: # Profile matches, SSID does not
+                    print(f"Device connected with correct profile ('{active_profile_name}') but wrong SSID ('{active_ssid}' vs '{target_ssid}'). Waiting...")
+                elif ip_address == "Not found": # Profile and SSID match, but no IP yet
+                    print(f"Device connected to '{target_ssid}' with profile '{profile_name_to_check}', but IP address not yet found. Waiting...")
+                else: # Should be caught by success, but as a fallback
+                    print(f"Device connected, but one or more checks failed unexpectedly. Profile: '{active_profile_name}', SSID: '{active_ssid}', IP: {ip_address}. Waiting...")
+            else: # Other unknown device states
+                 print(f"Device state is '{device_state}'. Waiting...")
+
+        except subprocess.TimeoutExpired:
+            print(f"Timeout during a command execution in connection check attempt {attempt}.")
         except Exception as e:
             print(f"Error during connection check attempt {attempt}: {e}")
 
-        time.sleep(3)
+        time.sleep(3) # Wait before next check
+
+    if not connected:
+        print(f"Connection check timed out after {timeout}s. Final status: Device State={device_state}, Active Profile='{active_profile_name}', Active SSID='{active_ssid}', IP={ip_address}")
 
     return connected, ip_address
 
@@ -250,6 +330,7 @@ def start_listener(host, port):
     """Starts listener, uses NetworkManager (nmcli) for WiFi config with a fixed or custom profile name."""
     server_socket = None
     try:
+        print(f"RPZero2WListener.py Version: {SCRIPT_VERSION}")
         server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         server_socket.bind((host, port))
@@ -359,5 +440,5 @@ def start_listener(host, port):
 if __name__ == "__main__":
     if os.geteuid() != 0:
         print("Warning: Script not running as root (sudo). NetworkManager commands will fail.")
-
+    print(f"Starting RPZero2WListener.py Version: {SCRIPT_VERSION}") # Also print here for direct execution
     start_listener(HOST, PORT)
