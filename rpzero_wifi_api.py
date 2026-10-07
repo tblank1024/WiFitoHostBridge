@@ -54,7 +54,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from ipaddress import ip_address, ip_network
 from urllib.parse import urlparse, parse_qs
 
-SCRIPT_VERSION = "0.1.2"
+SCRIPT_VERSION = "0.2.1"
 
 # --- Configuration (all overridable from the unit's Environment=) ---
 BIND_ADDR = os.environ.get("WIFI_API_BIND", "10.10.0.1")
@@ -501,6 +501,7 @@ _job = {
     "error": "",
     "started": 0,
     "finished": 0,
+    "rolled_back": False,
 }
 _job_lock = threading.Lock()
 
@@ -614,6 +615,269 @@ def networks_payload(want_rescan):
     }
 
 
+
+# ---------------------------------------------------------------------------
+# Mutating operations: connect and forget
+# ---------------------------------------------------------------------------
+# Only one at a time, and never on the HTTP thread. A connect takes seconds to
+# tens of seconds, and the UI polls /api/status throughout to follow it, so the
+# request returns 202 as soon as the job is accepted.
+
+_MUTATE_LOCK = threading.Lock()
+
+
+def active_wifi_uuid():
+    """UUID of the profile currently active on the WiFi interface, or ''."""
+    try:
+        for line in nmcli("-t", "-f", "UUID,DEVICE", "connection",
+                          "show", "--active").splitlines():
+            parts = split_terse(line)
+            if len(parts) >= 2 and parts[1] == IFNAME:
+                return parts[0]
+    except NmcliError:
+        pass
+    return ""
+
+
+def set_job(**fields):
+    with _job_lock:
+        _job.update(fields)
+
+
+def classify_activation_failure(stderr):
+    """
+    Maps nmcli's own words to an error code. Reading stderr beats polling for
+    this: a wrong password is reported as "Secrets were required" within
+    seconds, where a status poller would just time out after 45.
+    """
+    low = (stderr or "").lower()
+    if "secrets were required" in low or "802-1x" in low:
+        return "auth_failed", "the password was rejected"
+    if "no network with ssid" in low or "not available on device" in low:
+        return "no_ap", "that network is not in range"
+    if "timeout" in low or "timed out" in low:
+        return "nm_failed", "NetworkManager timed out bringing the connection up"
+    return "nm_failed", stderr.strip() or "NetworkManager could not connect"
+
+
+def key_mgmt_for(ssid, psk):
+    """
+    Picks key-mgmt from what the scan saw. The old listener hardcoded wpa-psk,
+    which is wrong for open networks and for WPA3-only APs.
+    """
+    networks, _ = NETWORKS_CACHE.peek()
+    security = ""
+    for network in networks or []:
+        if network["ssid"] == ssid:
+            security = network["security"]
+            break
+    if security in ("WPA3",):
+        return "sae"
+    if security == "" and not psk:
+        return ""          # open network: no security section at all
+    return "wpa-psk"
+
+
+def unique_profile_name(ssid, profiles):
+    """
+    A profile named after the SSID, suffixed if that name is taken. NM allows
+    duplicate names, and on this Zero the SSID 'Buckley Clan 2' already has a
+    profile called exactly that -- adding a second would be indistinguishable.
+    """
+    taken = {p["name"] for p in profiles}
+    if ssid not in taken:
+        return ssid
+    for suffix in range(2, 100):
+        candidate = f"{ssid} {suffix}"
+        if candidate not in taken:
+            return candidate
+    return f"{ssid} {int(time.time())}"
+
+
+def do_connect(ssid, psk, job_id):
+    """
+    Runs in its own thread. Holds _MUTATE_LOCK for its whole life; the caller
+    acquired it, this releases it.
+    """
+    added_uuid = ""
+    previous_uuid = active_wifi_uuid()
+    try:
+        profiles = PROFILES_CACHE.get(force=True)[0]
+        existing = index_by_ssid(profiles).get(ssid)
+
+        if existing and not psk:
+            # Saved credential: just bring it up.
+            target_uuid = existing["uuid"]
+            set_job(phase="activating saved profile")
+        elif existing and psk:
+            # Replacing the stored password. Irreversible: the old PSK cannot
+            # be read back, so the UI warns before getting here.
+            target_uuid = existing["uuid"]
+            set_job(phase="updating saved password")
+            km = existing["key_mgmt"] or key_mgmt_for(ssid, psk) or "wpa-psk"
+            nmcli("connection", "modify", target_uuid,
+                  "802-11-wireless-security.key-mgmt", km,
+                  "802-11-wireless-security.psk", psk)
+        else:
+            set_job(phase="creating profile")
+            name = unique_profile_name(ssid, profiles)
+            km = key_mgmt_for(ssid, psk)
+            args = ["connection", "add", "type", "wifi", "con-name", name,
+                    "ifname", IFNAME, "ssid", ssid]
+            if km:
+                args += ["--", "802-11-wireless-security.key-mgmt", km]
+                if psk:
+                    args += ["802-11-wireless-security.psk", psk]
+            nmcli(*args)
+            target_uuid = ""
+            for profile in load_profiles():
+                if profile["name"] == name:
+                    target_uuid = profile["uuid"]
+                    break
+            if not target_uuid:
+                raise NmcliFailed(1, f"profile '{name}' was not found after adding it")
+            added_uuid = target_uuid
+
+        set_job(phase="associating")
+        # -w blocks until NM finishes, so stderr carries the real reason.
+        nmcli("-w", "50", "connection", "up", "uuid", target_uuid, timeout=60)
+
+        state = nmcli_props(target_uuid, "connection.id").get("connection.id", "")
+        ip = ""
+        try:
+            ip = nmcli_get("IP4.ADDRESS", "device", "show", IFNAME)
+        except NmcliError:
+            pass
+        print(f"connect: joined {ssid!r} via profile {state!r} ip={ip}")
+        set_job(state="succeeded", phase="connected", error="",
+                finished=int(time.time()))
+
+    except NmcliError as exc:
+        stderr = getattr(exc, "stderr", "") or str(exc)
+        code, message = classify_activation_failure(stderr)
+        print(f"connect: failed for {ssid!r}: {code}: {message}")
+
+        # A profile created for this attempt must not survive it, or a typo
+        # permanently adds a bogus "saved" network.
+        if added_uuid:
+            try:
+                nmcli("connection", "delete", "uuid", added_uuid)
+                print(f"connect: removed the profile added for this attempt")
+            except NmcliError as cleanup_exc:
+                print(f"connect: WARNING could not remove added profile: {cleanup_exc}")
+
+        # Put the uplink back if we moved off it.
+        rolled_back = False
+        if previous_uuid and previous_uuid != added_uuid:
+            try:
+                nmcli("-w", "40", "connection", "up", "uuid", previous_uuid,
+                      timeout=50)
+                rolled_back = True
+                print("connect: rolled back to the previous network")
+            except NmcliError as rb_exc:
+                print(f"connect: WARNING rollback failed: {rb_exc}")
+
+        set_job(state="failed", phase="", error=f"{code}: {message}",
+                rolled_back=rolled_back, finished=int(time.time()))
+    finally:
+        PROFILES_CACHE.invalidate()
+        NETWORKS_CACHE.invalidate()
+        _MUTATE_LOCK.release()
+
+
+def validate_connect(ssid, psk):
+    """Returns an error message, or '' if the request is worth attempting."""
+    if not ssid:
+        return "an ssid is required"
+    if len(ssid.encode("utf-8")) > 32:
+        return "an ssid cannot exceed 32 bytes"
+    if ssid == SELF_AP_SSID:
+        return (f"{ssid!r} is this RV's own network; joining it would route the "
+                "uplink back through the RP5")
+    if psk and not 8 <= len(psk) <= 63:
+        return "a WPA password must be 8 to 63 characters"
+    return ""
+
+
+def handle_connect(body):
+    ssid = (body.get("ssid") or "").strip()
+    psk = body.get("psk") or ""
+    problem = validate_connect(ssid, psk)
+    if problem:
+        code = "blocked_self" if ssid and ssid == SELF_AP_SSID else "invalid_request"
+        return 400, {"ok": False, "error": code, "message": problem}
+    if not _MUTATE_LOCK.acquire(blocking=False):
+        return 409, {"ok": False, "error": "busy",
+                     "message": "another WiFi operation is already running",
+                     "operation": job_snapshot()}
+    job_id = f"{int(time.time())}-{ssid[:12]}"
+    set_job(id=job_id, op="connect", ssid=ssid, state="running",
+            phase="starting", error="", started=int(time.time()), finished=0,
+            rolled_back=False)
+    # The password is deliberately absent from this log line.
+    print(f"connect: requested ssid={ssid!r} psk={'yes' if psk else 'no'}")
+    threading.Thread(target=do_connect, args=(ssid, psk, job_id),
+                     daemon=True).start()
+    return 202, {"ok": True, "job_id": job_id, "ssid": ssid}
+
+
+def handle_forget(body):
+    uuid = (body.get("uuid") or "").strip()
+    ssid = (body.get("ssid") or "").strip()
+    force = bool(body.get("force"))
+    if not uuid and not ssid:
+        return 400, {"ok": False, "error": "invalid_request",
+                     "message": "a uuid or ssid is required"}
+
+    profiles = PROFILES_CACHE.get(force=True)[0]
+    by_uuid = {p["uuid"]: p for p in profiles}
+
+    if uuid:
+        target = by_uuid.get(uuid)
+        if target is None:
+            # Not in our list: either it does not exist, or it is not WiFi.
+            # Refusing protects the usb0 (802-3-ethernet) and lo profiles.
+            return 404, {"ok": False, "error": "not_found",
+                         "message": "no such saved WiFi profile"}
+    else:
+        matches = [p for p in profiles if p["ssid"] == ssid]
+        if not matches:
+            return 404, {"ok": False, "error": "not_found",
+                         "message": f"no saved profile for {ssid!r}"}
+        if len(matches) > 1:
+            return 409, {"ok": False, "error": "ambiguous",
+                         "message": (f"{ssid!r} has {len(matches)} saved profiles; "
+                                     "pass the uuid of the one to delete"),
+                         "candidates": [{"uuid": m["uuid"], "name": m["name"]}
+                                        for m in matches]}
+        target = matches[0]
+
+    if target["active"] and not force:
+        return 409, {"ok": False, "error": "active",
+                     "message": (f"{target['name']!r} is the network currently "
+                                 "providing the connection; pass force to delete it "
+                                 "anyway, which will disconnect the RV"),
+                     "profile": {"uuid": target["uuid"], "name": target["name"]}}
+
+    if not _MUTATE_LOCK.acquire(blocking=False):
+        return 409, {"ok": False, "error": "busy",
+                     "message": "another WiFi operation is already running",
+                     "operation": job_snapshot()}
+    try:
+        nmcli("connection", "delete", "uuid", target["uuid"])
+        print(f"forget: deleted profile {target['name']!r} (ssid {target['ssid']!r})")
+    except NmcliError as exc:
+        return 502, {"ok": False, "error": "nm_failed", "message": str(exc)}
+    finally:
+        PROFILES_CACHE.invalidate()
+        NETWORKS_CACHE.invalidate()
+        _MUTATE_LOCK.release()
+
+    return 200, {"ok": True, "deleted": {"uuid": target["uuid"],
+                                         "name": target["name"],
+                                         "ssid": target["ssid"]}}
+
+
 # ---------------------------------------------------------------------------
 # HTTP
 # ---------------------------------------------------------------------------
@@ -669,7 +933,13 @@ class Handler(BaseHTTPRequestHandler):
                 want = parse_qs(parsed.query).get("rescan", ["0"])[0]
                 self._send(200, networks_payload(want in ("1", "true", "yes")))
             elif path == "/api/profiles":
-                profiles, age = PROFILES_CACHE.get()
+                # refresh=1 bypasses the 60s cache. Our own connect/forget
+                # invalidate it, but a profile added or removed outside this
+                # service (nmcli by hand, or NM itself) is otherwise invisible
+                # for up to a minute.
+                want = parse_qs(parsed.query).get("refresh", ["0"])[0]
+                profiles, age = PROFILES_CACHE.get(
+                    force=want in ("1", "true", "yes"))
                 self._send(200, {"ok": True, "profiles": profiles,
                                  "age_seconds": round(age, 1)})
             else:
@@ -699,13 +969,39 @@ class Handler(BaseHTTPRequestHandler):
         if length > MAX_BODY_BYTES:
             self._error(413, "too_large", "request body too large")
             return
-        if length:
-            self.rfile.read(length)
-        if path in ("/api/connect", "/api/forget"):
-            self._error(501, "not_implemented",
-                        f"{path} arrives in phase 3; use the existing form for now")
+        raw = self.rfile.read(length) if length else b""
+        body = {}
+        if raw:
+            try:
+                body = json.loads(raw)
+            except ValueError:
+                self._error(400, "invalid_request", "body is not valid JSON")
+                return
+            if not isinstance(body, dict):
+                self._error(400, "invalid_request", "body must be a JSON object")
+                return
+        try:
+            if path == "/api/connect":
+                status, payload = handle_connect(body)
+            elif path == "/api/forget":
+                status, payload = handle_forget(body)
+            else:
+                self._error(404, "not_found", f"no such endpoint: {path}")
+                return
+        except NmcliNotFound as exc:
+            self._error(500, "nmcli_missing", str(exc))
             return
-        self._error(404, "not_found", f"no such endpoint: {path}")
+        except NmcliTimeout as exc:
+            self._error(504, "nmcli_timeout", str(exc))
+            return
+        except NmcliFailed as exc:
+            self._error(502, "nmcli_failed", exc.stderr or str(exc))
+            return
+        except Exception as exc:
+            print(f"ERROR handling {path}: {exc!r}")
+            self._error(500, "internal_error", "see the service journal")
+            return
+        self._send(status, payload)
 
 
 class Server(ThreadingHTTPServer):
