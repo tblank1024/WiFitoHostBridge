@@ -54,7 +54,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from ipaddress import ip_address, ip_network
 from urllib.parse import urlparse, parse_qs
 
-SCRIPT_VERSION = "0.1.0"
+SCRIPT_VERSION = "0.1.2"
 
 # --- Configuration (all overridable from the unit's Environment=) ---
 BIND_ADDR = os.environ.get("WIFI_API_BIND", "10.10.0.1")
@@ -70,7 +70,7 @@ SCAN_MIN_INTERVAL = float(os.environ.get("SCAN_MIN_INTERVAL", "10"))
 NMCLI_TIMEOUT = float(os.environ.get("NMCLI_TIMEOUT", "25"))
 STATUS_TTL = float(os.environ.get("STATUS_TTL", "1"))
 NETWORKS_TTL = float(os.environ.get("NETWORKS_TTL", "10"))
-PROFILES_TTL = float(os.environ.get("PROFILES_TTL", "15"))
+PROFILES_TTL = float(os.environ.get("PROFILES_TTL", "60"))
 MAX_WORKERS = int(os.environ.get("WIFI_API_MAX_WORKERS", "8"))
 BIND_RETRY_SECONDS = float(os.environ.get("BIND_RETRY_SECONDS", "60"))
 MAX_BODY_BYTES = 4096
@@ -183,6 +183,28 @@ def split_terse(line):
     return fields
 
 
+def nmcli_props(uuid, *fields):
+    """
+    Reads several properties of one profile in a single call.
+
+    `-t -f` output is NAME-tagged ("802-11-wireless.ssid:MyNet"), unlike `-g`,
+    which emits bare values positionally and silently omits inapplicable
+    fields. Tagged output makes omission harmless, so this is safe where
+    multi-field `-g` is not -- and it costs one nmcli process per profile
+    instead of one per property. On this Zero that is 9 invocations per refresh
+    instead of 36, which took 4.3s and measurably delayed packet forwarding.
+    """
+    out = nmcli("-t", "-f", ",".join(fields), "connection", "show", uuid)
+    props = {}
+    for line in out.splitlines():
+        if not line.strip():
+            continue
+        parts = split_terse(line)
+        if len(parts) >= 2:
+            props[parts[0]] = ":".join(parts[1:])
+    return props
+
+
 def nmcli_get(field, *args):
     """
     Reads one field with `-g`. Always one field per call: with several fields,
@@ -220,6 +242,15 @@ class Cache:
             self.value = self.loader()
             self.stamp = time.monotonic()
             return self.value, 0.0
+
+    def peek(self):
+        """
+        Returns (value, age) without waiting for a load in progress; value is
+        None if nothing has been cached yet. Callers that must never block on
+        another request's work use this instead of get().
+        """
+        value = self.value   # single attribute read; no lock needed
+        return value, (time.monotonic() - self.stamp if value is not None else None)
 
     def invalidate(self):
         with self.lock:
@@ -265,16 +296,20 @@ def load_profiles():
             continue
         uuid, name, _, timestamp = parts[0], parts[1], parts[2], parts[3]
         try:
-            ssid = nmcli_get("802-11-wireless.ssid", "connection", "show", uuid)
-            key_mgmt = nmcli_get("802-11-wireless-security.key-mgmt",
-                                 "connection", "show", uuid)
-            psk_flags = nmcli_get("802-11-wireless-security.psk-flags",
-                                  "connection", "show", uuid)
-            autoconnect = nmcli_get("connection.autoconnect",
-                                    "connection", "show", uuid)
+            props = nmcli_props(
+                uuid,
+                "802-11-wireless.ssid",
+                "802-11-wireless-security.key-mgmt",
+                "802-11-wireless-security.psk-flags",
+                "connection.autoconnect",
+            )
         except NmcliError as exc:
             print(f"warning: skipping profile {uuid}: {exc}")
             continue
+        ssid = props.get("802-11-wireless.ssid", "")
+        key_mgmt = props.get("802-11-wireless-security.key-mgmt", "")
+        psk_flags = props.get("802-11-wireless-security.psk-flags", "")
+        autoconnect = props.get("connection.autoconnect", "")
 
         secured = key_mgmt not in ("", "none")
         profiles.append({
@@ -507,18 +542,30 @@ def load_status():
     except NmcliError:
         pass
 
-    # SSID and live signal come from the cached scan, never a fresh rescan:
-    # this endpoint is polled every few seconds.
+    # The SSID comes from the active profile, not from the scan: profile NAME
+    # is not the SSID, and this endpoint must stay cheap and independent.
     ssid = ""
+    if profile_uuid:
+        try:
+            ssid = nmcli_get("802-11-wireless.ssid", "connection", "show",
+                             profile_uuid)
+        except NmcliError:
+            pass
+
+    # Live signal is best-effort from whatever the scan cache already holds.
+    # peek() never waits: get() holds its lock across a load, so a forced
+    # rescan would otherwise block this endpoint for the whole scan -- measured
+    # at 5.3s, while the UI polls status every 2-5s to follow a connect.
     signal = 0
-    try:
-        networks, _ = NETWORKS_CACHE.get()
+    scan_age = None
+    networks, scan_age = NETWORKS_CACHE.peek()
+    if networks:
         for network in networks:
-            if network["in_use"]:
-                ssid, signal = network["ssid"], network["signal"]
+            if network["in_use"] and (not ssid or network["ssid"] == ssid):
+                signal = network["signal"]
+                if not ssid:
+                    ssid = network["ssid"]
                 break
-    except NmcliError as exc:
-        print(f"warning: status could not read scan cache: {exc}")
 
     return {
         "wifi": {
@@ -529,6 +576,7 @@ def load_status():
             "profile_uuid": profile_uuid,
             "ip": ip,
             "gateway": gateway,
+            "signal_age_seconds": round(scan_age, 1) if scan_age is not None else None,
         },
         "operation": job_snapshot(),
         "service": {
