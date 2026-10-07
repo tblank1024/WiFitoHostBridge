@@ -67,9 +67,13 @@ import os
 import re
 
 # --- Configuration ---
-SCRIPT_VERSION = "1.0.9"
-HOST = "10.10.0.1"  # Listen only on this specific IP address
-PORT = 12345
+# HOST/PORT can be overridden via environment variables (keep these in sync with
+# WIFI_BRIDGE_HOST/WIFI_BRIDGE_PORT used by RP5toRPZero2WControl.py on the RP5):
+#   WIFI_BRIDGE_HOST  (default: 10.10.0.1)
+#   WIFI_BRIDGE_PORT  (default: 12345)
+SCRIPT_VERSION = "1.0.10"
+HOST = os.environ.get('WIFI_BRIDGE_HOST', '10.10.0.1')  # Listen only on this specific IP address
+PORT = int(os.environ.get('WIFI_BRIDGE_PORT', '12345'))
 WIFI_INTERFACE = "wlan0" # Ensure this matches your WiFi interface name
 CONNECTION_TIMEOUT = 45 # Increased timeout for NetworkManager
 LISTENER_PROFILE_NAME = "ListenerManagedWifi" # Fixed profile name for this script

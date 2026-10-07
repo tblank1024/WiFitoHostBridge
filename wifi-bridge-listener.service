@@ -11,6 +11,14 @@ User=root
 # ExecStart: Use the absolute path in the system location
 ExecStart=/usr/bin/python3 /usr/local/sbin/RPZero2WListener.py
 
+# Listener bind address/port. Defaults are 10.10.0.1:12345; uncomment to move
+# them, and set the matching WIFI_BRIDGE_HOST/WIFI_BRIDGE_PORT on the RP5
+# (docker-compose.yml webserver environment) so the client agrees.
+#Environment=WIFI_BRIDGE_HOST=10.10.0.1
+#Environment=WIFI_BRIDGE_PORT=12345
+# Optional: keep the overrides in a file instead ('-' = tolerate it missing)
+EnvironmentFile=-/etc/default/wifi-bridge-listener
+
 # Restart the service if it fails
 Restart=on-failure
 RestartSec=5

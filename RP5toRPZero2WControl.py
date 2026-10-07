@@ -80,9 +80,12 @@ def send_wifi_config(host, port, ssid, password, profile_name=None, retries=3, d
 
 
 if __name__ == "__main__":
-    # Configuration parameters
-    RPI_HOST = '10.10.0.1' # Default host IP
-    RPI_PORT = 12345      # Default host port
+    # Configuration parameters - can be overridden via environment variables:
+    #   WIFI_BRIDGE_HOST  (default: 10.10.0.1)
+    #   WIFI_BRIDGE_PORT  (default: 12345)
+    import os as _os
+    RPI_HOST = _os.environ.get('WIFI_BRIDGE_HOST', '10.10.0.1')
+    RPI_PORT = int(_os.environ.get('WIFI_BRIDGE_PORT', '12345'))
     exit_code = 1         # Default to general failure
 
     # Check for command-line arguments
@@ -139,4 +142,3 @@ if __name__ == "__main__":
 
     print(f"Done. Exiting with code {exit_code}.")
     sys.exit(exit_code)
-
