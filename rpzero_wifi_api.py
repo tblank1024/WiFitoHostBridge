@@ -54,7 +54,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from ipaddress import ip_address, ip_network
 from urllib.parse import urlparse, parse_qs
 
-SCRIPT_VERSION = "0.2.1"
+SCRIPT_VERSION = "0.2.2"
 
 # --- Configuration (all overridable from the unit's Environment=) ---
 BIND_ADDR = os.environ.get("WIFI_API_BIND", "10.10.0.1")
@@ -653,7 +653,8 @@ def classify_activation_failure(stderr):
     low = (stderr or "").lower()
     if "secrets were required" in low or "802-1x" in low:
         return "auth_failed", "the password was rejected"
-    if "no network with ssid" in low or "not available on device" in low:
+    if ("no network with ssid" in low or "not available on device" in low
+            or "could not be found" in low):
         return "no_ap", "that network is not in range"
     if "timeout" in low or "timed out" in low:
         return "nm_failed", "NetworkManager timed out bringing the connection up"
@@ -773,6 +774,16 @@ def do_connect(ssid, psk, job_id):
                 nmcli("-w", "40", "connection", "up", "uuid", previous_uuid,
                       timeout=50)
                 rolled_back = True
+                # `connection up` returns once activation starts; DHCP can
+                # still be outstanding, and reporting the failure in that gap
+                # makes the UI flash "disconnected" before it recovers.
+                for _ in range(10):
+                    try:
+                        if nmcli_get("IP4.ADDRESS", "device", "show", IFNAME):
+                            break
+                    except NmcliError:
+                        pass
+                    time.sleep(1)
                 print("connect: rolled back to the previous network")
             except NmcliError as rb_exc:
                 print(f"connect: WARNING rollback failed: {rb_exc}")
