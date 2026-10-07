@@ -1,0 +1,44 @@
+[Unit]
+Description=WiFi Bridge HTTP API (NetworkManager, JSON over 10.10.0.1)
+Documentation=https://github.com/tblank1024/WiFitoHostBridge
+# usb0-up.service assigns 10.10.0.1/24; binding before it exists fails with
+# EADDRNOTAVAIL. The service also retries the bind for 60s on its own, so an
+# ordering surprise degrades to a slow start rather than a failed one.
+Wants=usb0-up.service network-online.target
+After=usb0-up.service network-online.target NetworkManager.service
+
+[Service]
+Type=simple
+# Root is required: as an unprivileged user, a WiFi rescan is silently ignored
+# and returns only the already-connected AP.
+User=root
+ExecStart=/usr/bin/python3 /usr/local/sbin/rpzero_wifi_api.py
+
+# Without this, Python block-buffers stdout into the journal pipe and nothing
+# appears until ~8KB has accumulated -- a long-lived service never gets there.
+Environment=PYTHONUNBUFFERED=1
+# This Zero's locale is broken (setlocale: cannot change locale en_US.UTF-8)
+# and nmcli's output is locale-dependent.
+Environment=LC_ALL=C
+Environment=LANG=C
+
+# Bind address and port. 10.10.0.1 is the point-to-point USB link to the RP5;
+# do NOT bind 0.0.0.0 -- wlan0 sits on an untrusted foreign network and this
+# API runs as root.
+Environment=WIFI_API_BIND=10.10.0.1
+Environment=WIFI_API_PORT=12346
+# Only the RP5 across the USB link. The dashboard runs on the RP5
+# (network_mode: host), so its requests arrive from 10.10.0.17.
+Environment=WIFI_API_ALLOWED_NET=10.10.0.0/24
+Environment=WIFI_IFNAME=wlan0
+# The RV's own AP, broadcast by the RP5. Joining it would loop the uplink back
+# through the RP5 that depends on this Zero, so it is never offered.
+Environment=SELF_AP_SSID=Sophie
+Environment=SCAN_MIN_INTERVAL=10
+EnvironmentFile=-/etc/default/wifi-bridge-api
+
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

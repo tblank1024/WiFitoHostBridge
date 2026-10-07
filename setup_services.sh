@@ -1,88 +1,98 @@
 #!/bin/bash
+#
+# Installs the WiFi bridge services on the Pi Zero 2W.
+#
+# Usage (run ON the Zero, with sudo):
+#   sudo ./setup_services.sh listener   # the legacy socket listener (port 12345)
+#   sudo ./setup_services.sh api        # the HTTP JSON API (port 12346)
+#   sudo ./setup_services.sh both       # both (default)
+#
+# The two services use different ports and can run side by side; that is how
+# the cutover is meant to happen. Restarting either one does NOT disturb the
+# uplink -- NetworkManager owns wlan0 independently of these processes, and
+# usb0 is static and NM-unmanaged, so the RP5 never loses contact with the Zero.
 
-# === Configuration ===
-# Service file name (assuming it is in the current directory)
-LISTENER_SERVICE_FILE="wifi-bridge-listener.service"
+set -u
 
-# Python script name (assuming it is in the current directory)
-LISTENER_SCRIPT_NAME="RPZero2WListener.py"
-# Destination for the Python script
 SCRIPT_DEST_DIR="/usr/local/sbin"
-SCRIPT_DEST_PATH="$SCRIPT_DEST_DIR/$LISTENER_SCRIPT_NAME"
+SYSTEMD_DEST="/etc/systemd/system"
 
-# Destination for systemd service files
-SYSTEMD_DEST="/etc/systemd/system/"
+LISTENER_SCRIPT="RPZero2WListener.py"
+LISTENER_UNIT="wifi-bridge-listener.service"
+API_SCRIPT="rpzero_wifi_api.py"
+API_UNIT="wifi-bridge-api.service"
 
-# === Script Logic ===
+MODE="${1:-both}"
+case "$MODE" in
+  listener|api|both) ;;
+  *) echo "Usage: sudo $0 [listener|api|both]" >&2; exit 2 ;;
+esac
 
-# Check if running as root
 if [ "$(id -u)" -ne 0 ]; then
-  echo "Error: This script must be run with sudo." >&2
+  echo "Error: this script must be run with sudo." >&2
   exit 1
 fi
 
-# Check if listener service file exists in the current directory
-if [ ! -f "$LISTENER_SERVICE_FILE" ]; then
-    echo "Error: Listener service file '$LISTENER_SERVICE_FILE' not found in the current directory." >&2
-    exit 1
+# install_service <script> <unit>
+install_service() {
+  local script="$1" unit="$2"
+
+  for f in "$script" "$unit"; do
+    if [ ! -f "$f" ]; then
+      echo "Error: '$f' not found in the current directory." >&2
+      return 1
+    fi
+  done
+
+  echo "--- Installing $unit ---"
+
+  # Keep a copy of whatever is being replaced; a rollback must not require
+  # the internet, which may be exactly what is broken.
+  if [ -f "$SCRIPT_DEST_DIR/$script" ] && \
+     ! cmp -s "$script" "$SCRIPT_DEST_DIR/$script"; then
+    cp "$SCRIPT_DEST_DIR/$script" "$SCRIPT_DEST_DIR/$script.prev" || return 1
+    echo "  previous version saved as $SCRIPT_DEST_DIR/$script.prev"
+  fi
+
+  install -m 755 -o root -g root "$script" "$SCRIPT_DEST_DIR/$script" || return 1
+  install -m 644 -o root -g root "$unit" "$SYSTEMD_DEST/$unit" || return 1
+
+  systemctl daemon-reload || return 1
+  systemctl enable "$unit" >/dev/null 2>&1 || return 1
+  systemctl restart "$unit" || return 1
+
+  sleep 2
+  if ! systemctl is-active --quiet "$unit"; then
+    echo "  ERROR: $unit is not active after restart." >&2
+    systemctl status "$unit" --no-pager | head -12 >&2
+    return 1
+  fi
+
+  echo "  active. Version banner from the journal:"
+  journalctl -u "$unit" -n 20 --no-pager 2>/dev/null \
+    | grep -iE "version|listening" | tail -3 | sed 's/^/    /'
+  return 0
+}
+
+RC=0
+if [ "$MODE" = "listener" ] || [ "$MODE" = "both" ]; then
+  install_service "$LISTENER_SCRIPT" "$LISTENER_UNIT" || RC=1
+fi
+if [ "$MODE" = "api" ] || [ "$MODE" = "both" ]; then
+  install_service "$API_SCRIPT" "$API_UNIT" || RC=1
 fi
 
-# Check if Python script exists in the current directory
-if [ ! -f "$LISTENER_SCRIPT_NAME" ]; then
-    echo "Error: Python script '$LISTENER_SCRIPT_NAME' not found in the current directory." >&2
-    exit 1
+if [ "$RC" -ne 0 ]; then
+  echo ""
+  echo "--- FAILED --- see the errors above. The previous script version, if"
+  echo "any, is at $SCRIPT_DEST_DIR/<script>.prev"
+  exit "$RC"
 fi
 
-echo "--- Setting up WiFi Bridge Listener Service ---"
-
-# --- Python Script Setup ---
-echo "1. Copying Python script ($LISTENER_SCRIPT_NAME) to $SCRIPT_DEST_DIR..."
-# Create directory if it doesn't exist (though it usually does)
-mkdir -p "$SCRIPT_DEST_DIR"
-cp "$LISTENER_SCRIPT_NAME" "$SCRIPT_DEST_PATH"
-if [ $? -ne 0 ]; then echo "Error copying Python script. Aborting."; exit 1; fi
-
-echo "2. Setting permissions for $SCRIPT_DEST_PATH..."
-# Make it readable and executable by all, writable only by root
-chmod 755 "$SCRIPT_DEST_PATH"
-if [ $? -ne 0 ]; then echo "Error setting permissions for Python script. Aborting."; exit 1; fi
-
-# --- Listener Service Setup ---
-echo "3. Copying Listener service file ($LISTENER_SERVICE_FILE) to $SYSTEMD_DEST..."
-cp "$LISTENER_SERVICE_FILE" "$SYSTEMD_DEST"
-if [ $? -ne 0 ]; then echo "Error copying listener service file. Aborting."; exit 1; fi
-
-echo "4. Setting permissions for $SYSTEMD_DEST$LISTENER_SERVICE_FILE..."
-chmod 644 "$SYSTEMD_DEST$LISTENER_SERVICE_FILE"
-if [ $? -ne 0 ]; then echo "Error setting permissions for listener service file. Aborting."; exit 1; fi
-
-# --- Systemd Configuration ---
-echo "5. Reloading systemd daemon..."
-systemctl daemon-reload
-if [ $? -ne 0 ]; then echo "Error reloading systemd daemon. Aborting."; exit 1; fi
-
-echo "6. Enabling Listener service ($LISTENER_SERVICE_FILE) to start on boot..."
-systemctl enable "${LISTENER_SERVICE_FILE%.service}" # Use filename without .service extension
-if [ $? -ne 0 ]; then echo "Error enabling listener service. Aborting."; exit 1; fi
-
-echo "--- Setup Complete ---"
 echo ""
-echo "IMPORTANT NEXT STEPS:"
-echo "1. EDIT the listener service file in $SYSTEMD_DEST:"
-echo "   - sudo nano $SYSTEMD_DEST$LISTENER_SERVICE_FILE"
-echo "   - Verify 'ExecStart' path points to '$SCRIPT_DEST_PATH'."
-echo "   - Verify 'User' is 'root'."
-echo "   - Ensure 'WorkingDirectory' is either removed or commented out."
-echo "2. After editing, reload the daemon again:"
-echo "   - sudo systemctl daemon-reload"
-echo "3. You can now start the listener service manually to test:"
-echo "   - sudo systemctl start ${LISTENER_SERVICE_FILE%.service}"
-echo "4. Check the status:"
-echo "   - sudo systemctl status ${LISTENER_SERVICE_FILE%.service}"
-echo "5. View logs:"
-echo "   - journalctl -u ${LISTENER_SERVICE_FILE%.service} -f"
-echo "The listener service is now enabled and will start automatically on the next boot (after you've correctly edited the file)."
-echo "Remember to run the client script (e.g., ControltoRPZero2W.py) from a *different* machine to send commands."
-echo "Consider removing the old script location if it was previously in a user directory."
-
+echo "--- Done ---"
+echo "Verify from the RP5 (not from here):"
+echo "  curl -s http://10.10.0.1:12346/api/health"
+echo "  curl -s 'http://10.10.0.1:12346/api/networks?rescan=1'"
+echo "Logs:   journalctl -u $API_UNIT -f"
 exit 0
