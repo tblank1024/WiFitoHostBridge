@@ -2,6 +2,15 @@ import socket
 import time
 import sys # Import sys module for command-line arguments
 
+# --- Timeouts ---
+# The listener is single-threaded and one request can take ~70 s (delete + add
+# profile, nmcli up, then up to 45 s waiting for an IP), so the wait for its
+# answer must be well clear of that. Keep the web server's subprocess timeout
+# (server.py /api/wifi-config) larger than RESPONSE_TIMEOUT.
+CONNECT_TIMEOUT = 10   # seconds to establish the TCP connection
+RESPONSE_TIMEOUT = 90  # seconds to wait for the listener's answer
+
+
 def send_wifi_config(host, port, ssid, password, profile_name=None, retries=3, delay=5):
     """
     Sends a special packet to the bridge program to configure WiFi.
@@ -11,33 +20,57 @@ def send_wifi_config(host, port, ssid, password, profile_name=None, retries=3, d
         100: Activation failed (likely bad password), but SSID/PW were updated/profile modified.
         101: WiFi didn't connect after activation attempt (e.g. bad/unreachable SSID, timeout),
              but SSID/PW were updated/profile modified.
-    """
-    client_socket = None # Initialize client_socket
-    for attempt in range(1, retries + 1):
-        try:
-            # Create a TCP socket
-            client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            client_socket.settimeout(10) # Add a timeout for connection and recv
 
-            # Connect to the bridge program
+    Retries cover the connect phase only. Once the request has been delivered the
+    listener is committed to it, so a slow or missing answer is reported rather
+    than resent -- resending would queue a duplicate request behind the one still
+    running and the listener would not answer either in time.
+    """
+    # Create the special packet
+    if profile_name:
+        packet = f"SET_WIFI_PROFILE,{ssid},{password},{profile_name}"
+        packet_desc = f"SET_WIFI_PROFILE,{ssid},<password_hidden>,{profile_name}"
+    else:
+        packet = f"SET_WIFI,{ssid},{password}"
+        packet_desc = f"SET_WIFI,{ssid},<password_hidden>"
+
+    for attempt in range(1, retries + 1):
+        # --- Connect phase: retryable, nothing has been asked of the Zero yet ---
+        client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        client_socket.settimeout(CONNECT_TIMEOUT)
+        connected = False
+        try:
             print(f"Attempt {attempt}: Connecting to {host}:{port}...")
             client_socket.connect((host, port))
+            connected = True
             print(f"Connected to {host}:{port}")
+        except socket.timeout:
+            print(f"Attempt {attempt} failed: Connection timed out after {CONNECT_TIMEOUT}s.")
+        except socket.error as e:
+            print(f"Attempt {attempt} failed: Socket error - {e}")
+        except Exception as e:
+            print(f"Attempt {attempt} failed: Unexpected error - {e}")
 
-            # Create the special packet
-            if profile_name:
-                packet = f"SET_WIFI_PROFILE,{ssid},{password},{profile_name}"
-                print(f"Sent packet: SET_WIFI_PROFILE,{ssid},<password_hidden>,{profile_name}")
-            else:
-                packet = f"SET_WIFI,{ssid},{password}"
-                print(f"Sent packet: SET_WIFI,{ssid},<password_hidden>")
-
-            # Send the packet
-            client_socket.sendall(packet.encode('utf-8'))
-
-            # Receive the response
-            response = client_socket.recv(1024).decode('utf-8')
-            print(f"Received response: {response}")
+        # --- Request phase: delivered once, never resent ---
+        if connected:
+            try:
+                client_socket.sendall(packet.encode('utf-8'))
+                print(f"Sent packet: {packet_desc}")
+                client_socket.settimeout(RESPONSE_TIMEOUT)
+                print(f"Waiting up to {RESPONSE_TIMEOUT}s for the listener's response...")
+                response = client_socket.recv(1024).decode('utf-8')
+                print(f"Received response: {response}")
+            except socket.timeout:
+                print(f"No response within {RESPONSE_TIMEOUT}s. The request was delivered and the "
+                      "listener may still be working on it - check 'journalctl -u "
+                      "wifi-bridge-listener' on the Zero. Not resending.")
+                return 1
+            except Exception as e:
+                print(f"Failed while waiting for the listener's response: {e}. "
+                      "The request was already delivered, so it is not being resent.")
+                return 1
+            finally:
+                client_socket.close()
 
             # Determine exit code based on response
             if response == "WiFi connection successful":
@@ -53,30 +86,16 @@ def send_wifi_config(host, port, ssid, password, profile_name=None, retries=3, d
             else:
                 # All other errors from listener (e.g., profile add failure, invalid packet), or unexpected responses
                 return 1
-        except socket.timeout:
-             print(f"Attempt {attempt} failed: Connection or receive timed out.")
-        except socket.error as e:
-            print(f"Attempt {attempt} failed: Socket error - {e}")
-        except Exception as e:
-            print(f"Attempt {attempt} failed: Unexpected error - {e}")
 
-        # Close socket before retrying or exiting loop
-        if client_socket:
-            client_socket.close()
-            client_socket = None # Reset for next attempt
-
-        # Retry logic
+        # Connect failed: clean up and retry if attempts remain
+        client_socket.close()
         if attempt < retries:
             print(f"Retrying in {delay} seconds...")
             time.sleep(delay)
         else:
             print("All attempts failed. Please check the connection and try again.")
-            return 1 # General failure if all retries fail
 
-    # Ensure socket is closed if loop finishes without success (should be caught by return 1 above)
-    if client_socket:
-        client_socket.close()
-    return 1 # Default to general failure if something unexpected happens
+    return 1 # Could not reach the listener
 
 
 if __name__ == "__main__":
