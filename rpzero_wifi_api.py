@@ -54,7 +54,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from ipaddress import ip_address, ip_network
 from urllib.parse import urlparse, parse_qs
 
-SCRIPT_VERSION = "0.2.2"
+SCRIPT_VERSION = "0.2.3"
 
 # --- Configuration (all overridable from the unit's Environment=) ---
 BIND_ADDR = os.environ.get("WIFI_API_BIND", "10.10.0.1")
@@ -507,8 +507,17 @@ _job_lock = threading.Lock()
 
 
 def job_snapshot():
+    """
+    The last operation, plus how long ago it finished. age_seconds is computed
+    here on purpose: the browser, the RP5 and the Zero each have their own
+    clock, so a consumer deciding "is this news or history?" must not have to
+    compare an epoch timestamp against its own time.
+    """
     with _job_lock:
-        return dict(_job)
+        snapshot = dict(_job)
+    finished = snapshot.get("finished") or 0
+    snapshot["age_seconds"] = round(time.time() - finished, 1) if finished else None
+    return snapshot
 
 
 def load_status():
