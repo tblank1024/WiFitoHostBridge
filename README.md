@@ -74,8 +74,10 @@ Pick one:
 **A. Edit on the laptop (internet), run on the RP5 over SSH (recommended).**
 Laptop stays on normal internet. Reach the RP5 at `192.168.2.196` when home/ethernet-connected
 (see `~/.ssh/config`). Edit files locally with Claude, then `scp` or `git push` / `git pull` on
-the RP5, restart the service/container. Use SSH from the RP5 to the Zero (`ssh pi@10.10.0.1`) to
+the RP5, restart the service/container. Use SSH from the RP5 to the Zero (`ssh zero`, i.e. tblank@10.10.0.1) to
 see the listener logs. The RP5 is the jump host; the laptop never needs to be on 10.10.0.x.
+From the RP5, `ssh zero` is configured in `~/.ssh/config` (user `tblank`, key
+`~/.ssh/id_ed25519_zero`); the account is `tblank`, not `pi`.
 
 **B. Samba mount of the RP5 code** (see `~/dotfiles/claude/CLAUDE-laptop.md`, "Remote Machine
 Access"): edit live files natively from the laptop while it stays on internet.
@@ -84,8 +86,12 @@ Access"): edit live files natively from the laptop while it stays on internet.
 Test through the RP5 instead.
 
 Deploying changes:
-- Listener (on Zero): `scp RPZero2WListener.py <zero>:/tmp/` then
-  `sudo cp /tmp/RPZero2WListener.py /usr/local/sbin/ && sudo systemctl restart wifi-bridge-listener`.
+- Listener (on Zero): `scp RPZero2WListener.py zero:/tmp/` then
+  `ssh -t zero 'sudo cp /tmp/RPZero2WListener.py /usr/local/sbin/ && sudo systemctl restart wifi-bridge-listener'`
+  (`-t`: sudo on the Zero prompts for a password).
+  Restarting the listener does not disturb the uplink -- it only drops the control
+  socket; NetworkManager keeps wlan0 and the USB link up. Sending SET_WIFI *does*
+  risk the uplink, so do not test a reconfiguration from a session that depends on it.
   Bump `SCRIPT_VERSION`; it is logged at start-up so you can confirm the new code is running.
 - Client / web server (on RP5): `cd rv/docker && docker compose up -d --build webserver`.
 - Service unit: `wifi-bridge-listener.service` -> `/etc/systemd/system/`, then
