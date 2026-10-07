@@ -1,0 +1,85 @@
+# filepath: /etc/systemd/system/host-bridge.service
+[Unit]
+Description=Host Bridge Service for WiFi Configuration
+# Wait for the network stack to be fully online, including IP address assignment
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+# User=root # Service runs as root by default, uncomment if needed explicitly
+# Group=root # Optional
+
+# Set the working directory to where the script resides
+WorkingDirectory=/path/to/your/script/
+
+# Command to execute the script using python3
+# Use full paths for reliability
+ExecStart=/usr/bin/python3 /path/to/your/script/host-bridge.py
+
+# Restart the service if i# filepath: /etc/systemd/system/host-bridge.service
+[Unit]
+Description=Host Bridge Service for WiFi Configuration
+# Wait for the network stack to be fully online, including IP address assignment
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+# User=root # Service runs as root by default, uncomment if needed explicitly
+# Group=root # Optional
+
+# Set the working directory to where the script resides
+WorkingDirectory=/path/to/your/script/
+
+# Command to execute the script using python3
+# Use full paths for reliability
+ExecStart=/usr/bin/python3 /path/to/your/script/host-bridge.py
+
+# Restart the service if it fails
+Restart=on-failure
+RestartSec=5s
+
+# Standard output and error logging will go to journald
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+# Start the service in the default multi-user runlevel
+WantedBy=multi-user.target# filepath: /etc/systemd/system/host-bridge.service
+[Unit]
+Description=Host Bridge Service for WiFi Configuration
+# Wait for the network stack to be fully online, including IP address assignment
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+# User=root # Service runs as root by default, uncomment if needed explicitly
+# Group=root # Optional
+
+# Set the working directory to where the script resides
+WorkingDirectory=/path/to/your/script/
+
+# Command to execute the script using python3
+# Use full paths for reliability
+ExecStart=/usr/bin/python3 /path/to/your/script/host-bridge.py
+
+# Restart the service if it fails
+Restart=on-failure
+RestartSec=5s
+
+# Standard output and error logging will go to journald
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+# Start the service in the default multi-user runlevel
+WantedBy=multi-user.targett fails
+Restart=on-failure
+RestartSec=5s
+
+# Standard output and error logging will go to journald
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+# Start the service in the default multi-user runlevel
+WantedBy=multi-user.target

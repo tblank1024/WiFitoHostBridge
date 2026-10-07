@@ -32,7 +32,7 @@ Expected Output (on Pi Zero W console):
 ---------------------------------------
 Listening on <HOST>:<PORT>...
 Connection from <Client IP Address>
-Received data: SET_WIFI,<SSID>,<PASSWORD>
+Received data: SET_WIFI,<SSID>,***        (the password is never logged)
 Attempting to configure WiFi via NetworkManager: SSID=<SSID> using profile 'ListenerManagedWifi'
 Attempting to delete existing connection profile: ListenerManagedWifi...
 Adding/Modifying connection profile 'ListenerManagedWifi' for SSID: <SSID>...
@@ -71,7 +71,7 @@ import re
 # WIFI_BRIDGE_HOST/WIFI_BRIDGE_PORT used by RP5toRPZero2WControl.py on the RP5):
 #   WIFI_BRIDGE_HOST  (default: 10.10.0.1)
 #   WIFI_BRIDGE_PORT  (default: 12345)
-SCRIPT_VERSION = "1.0.10"
+SCRIPT_VERSION = "1.0.11"
 HOST = os.environ.get('WIFI_BRIDGE_HOST', '10.10.0.1')  # Listen only on this specific IP address
 PORT = int(os.environ.get('WIFI_BRIDGE_PORT', '12345'))
 WIFI_INTERFACE = "wlan0" # Ensure this matches your WiFi interface name
@@ -79,12 +79,58 @@ CONNECTION_TIMEOUT = 45 # Increased timeout for NetworkManager
 LISTENER_PROFILE_NAME = "ListenerManagedWifi" # Fixed profile name for this script
 # --- End Configuration ---
 
+# Argument names whose VALUE is a secret; the token following any of these is
+# masked before anything is logged. journald keeps what we print, so a password
+# printed once is a password on disk.
+_SECRET_ARGS = {
+    "wifi-sec.psk",
+    "802-11-wireless-security.psk",
+    "password",
+    "psk",
+}
+
+
+def redact_args(command):
+    """Returns the command as a loggable string with secret values masked."""
+    out = []
+    mask_next = False
+    for token in command:
+        if mask_next:
+            out.append("***")
+            mask_next = False
+            continue
+        out.append(token)
+        mask_next = token in _SECRET_ARGS
+    return " ".join(out)
+
+
+def redact_packet(data):
+    """
+    Masks the password field of a SET_WIFI / SET_WIFI_PROFILE request.
+    Splits exactly as the request parser below does, so a password containing
+    commas is masked whole rather than partially exposed.
+    """
+    if data.startswith("SET_WIFI_PROFILE,"):
+        parts = data.split(",", 3)   # cmd, ssid, password, profile
+        if len(parts) == 4:
+            parts[2] = "***"
+            return ",".join(parts)
+        return "SET_WIFI_PROFILE,<malformed>"
+    if data.startswith("SET_WIFI,"):
+        parts = data.split(",", 2)   # cmd, ssid, password (may contain commas)
+        if len(parts) == 3:
+            parts[2] = "***"
+            return ",".join(parts)
+        return "SET_WIFI,<malformed>"
+    return "<unrecognized command>"
+
+
 def run_command(command, suppress_stderr=False):
     """
     Runs a shell command and returns its stdout. Raises exception on failure.
     """
     try:
-        print(f"Running command: {' '.join(command)}")
+        print(f"Running command: {redact_args(command)}")
         result = subprocess.run(
             command,
             capture_output=True,
@@ -350,7 +396,7 @@ def start_listener(host, port):
                 print(f"\nConnection from {addr}")
 
                 data = client_socket.recv(1024).decode('utf-8').strip()
-                print(f"Received data: {data}")
+                print(f"Received data: {redact_packet(data)}")
 
                 response_message = b"Unknown error occurred"
                 final_status = "failed: unknown reason"
