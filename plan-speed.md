@@ -110,27 +110,54 @@ sleep 5; timeout 90 speedtest-cli --simple; wait
 Compare the RTTs during the speedtest with idle RTTs from the first 5 s. An increase of more than ~100 ms => queueing at
 the bottleneck (candidate: `cake` on the Zero).
 
-## Test 1 — AP hop (Roku position <-> RP5) — [USER] + agent
+## Laptop at the Roku position — [USER] one-time setup
 
-Agent: start a server that logs results itself, so the user only presses Start:
+Tests 1 and 7 use the Windows laptop as the far end of the WiFi hop, so the agent can drive them from the RP5.
+Ask the user to do this once and report the laptop's IP:
+
+1. Put the laptop exactly where the Roku sits (same height/orientation, if practical). **Plug it in** (battery
+   power saving throttles WiFi).
+2. Connect it to **Sophie WiFi only**: unplug Ethernet, disconnect VPN, check it didn't join another saved SSID.
+3. Install iperf3 for Windows (iperf.fr build or a winget package) and open the firewall (admin PowerShell):
+   `New-NetFirewallRule -DisplayName iperf3 -Direction Inbound -Protocol TCP -LocalPort 5201 -Action Allow`
+4. Start the server and leave it running: `iperf3 -s`
+5. Report `ipconfig` (IPv4 address on the WiFi adapter => `<LAPTOP>`) and `netsh wlan show interfaces`
+   (radio type, channel, signal %, receive/transmit rate).
+
+Agent check: `ping -c 3 <LAPTOP>` and `iw dev wlan0 station dump` (find the laptop's MAC => `<LAPTOP_MAC>`).
+
+Caveat: the laptop's radio (probably 2x2, better antennas) is better than the Roku's, so absolute numbers are
+optimistic for the Roku. Bottlenecks (11g cap, 2.4 GHz contention) still show up the same way. The laptop also keeps
+using the Zero uplink for its own traffic; ask the user to keep it idle during tests.
+
+## Test 1 — AP hop (Roku position <-> RP5) — agent (laptop placed by [USER])
+
+Direction: client on RP5 sends by default => default = **download to the Roku position** (what the Roku cares about);
+`-R` = upload.
 ```bash
-iperf3 -s -1 -D --logfile ~/speed-results/<run>/ap_down.log
+for i in 1 2 3; do timeout 40 iperf3 -c <LAPTOP> -t 20 --json > ap_down_$i.json; done
+for i in 1 2 3; do timeout 40 iperf3 -c <LAPTOP> -t 20 -R --json > ap_up_$i.json; done
+timeout 40 iperf3 -c <LAPTOP> -t 20 -P 4 --json > ap_down_P4.json      # 4 streams; if much higher than 1 stream => per-flow limits (latency/loss), not airtime
+iw dev wlan0 station get <LAPTOP_MAC>                                  # capture during/after: tx bitrate, retries, failed
 ```
-Ask the user: *"Stand where the Roku is, open an iperf3 app (Android: Magic iPerf / HE.NET Network Tools; iOS:
-HE.NET Network Tools), connect to Sophie WiFi, run a client to `<SOPHIE>` port 5201, 20 s, **reverse mode
-(-R)**, tell me when done."* Then repeat without -R for upload (new server with a different logfile).
-While it runs, capture `iw dev wlan0 station dump` to get the phone's link rate.
-Interpretation: < ~20 Mbps download with good signal => AP config is a limiter.
+Also capture `iw dev wlan0 station get <ROKU_MAC>` to compare the Roku's link rate with the laptop's.
+Interpretation: < ~20 Mbps download with good signal => AP config is a limiter. Laptop link rate stuck at <= 54
+Mbit/s => confirms the 11g/no-WMM cap.
 
 ## Test 5 — End to end — [USER]
 
-Ask the user to run fast.com or the Speedtest app on the phone at the Roku position (3 runs) and report the numbers,
-and optionally Roku Settings > Network > Check connection. Compare with min(Test 1, Test 3).
+Ask the user to run fast.com or speedtest.net in a browser on the laptop at the Roku position (3 runs) and report the
+numbers. Optional: Roku Settings > Network > Check connection. Compare with min(Test 1, Test 3).
 
-## Test 7 — Co-channel contention — [USER] + agent
+## Test 7 — Co-channel contention — agent
 
-Same as Test 1 (reverse, but `-t 60`), and while the user's test runs, the agent runs Test 3 once on the Zero.
-If the two results together are much lower than when run separately => the two 2.4 GHz radios share airtime => 5 GHz AP helps.
+Run the AP hop and the Zero uplink at the same time:
+```bash
+timeout 80 iperf3 -c <LAPTOP> -t 60 --json > ap_down_concurrent.json &
+sleep 10; ssh pi@10.10.0.1 'timeout 90 speedtest-cli --simple' > zero_concurrent.txt; wait
+```
+If the two results together are much lower than the same tests run separately => the two 2.4 GHz radios share
+airtime => 5 GHz AP helps.
 
 ## A/B fixes (one at a time; re-run the listed tests)
 
@@ -148,22 +175,25 @@ Notes:
   C/D, check whether RaspAP's settings need the same change so it doesn't revert on the next UI save.
 - After C/D, check `journalctl -u hostapd -n 50` for "Could not set channel"/"driver" errors. If hostapd fails to
   start, revert immediately, since the RV has no WiFi until you do.
+- A hostapd restart drops the laptop too. Before re-running Test 1, ask the user to confirm the laptop rejoined
+  Sophie WiFi (on 5 GHz after D) and that `iperf3 -s` is still running; re-check `<LAPTOP>` (DHCP may change it).
 - Once a fix is proven, update `rv/buildRP5RaspAP/install_raspap_bridge.sh` (hostapd block) and/or
   `RPZero2WListener.py` to match, and commit.
 
 ## Results
 
-Fill in during the run. Date / location / campground SSID / Zero signal (dBm) / Zero channel / AP channel / Roku link rate:
+Fill in during the run. Date / location / campground SSID / Zero signal (dBm) / Zero channel / AP channel / Roku link rate / laptop link rate:
 
 | Test | Run 1 | Run 2 | Run 3 | Notes |
 |------|-------|-------|-------|-------|
-| 1 AP up (Mbps) | | | | |
-| 1 AP down (Mbps) | | | | |
+| 1 AP down to laptop (Mbps) | | | | |
+| 1 AP up from laptop (Mbps) | | | | |
+| 1 AP down, 4 streams | | | | |
 | 2 USB RP5->Zero | | | | |
 | 2 USB Zero->RP5 | | | | |
 | 3 Zero down/up | | | | |
 | 4 RP5 down/up | | | | |
-| 5 Phone at Roku | | | | |
+| 5 Laptop at Roku (browser) | | | | |
 | 6 Zero->GW ping min/avg/max | | | | |
 | 6 RP5->Zero ping min/avg/max | | | | |
 | 7 Concurrent (AP / uplink) | | | | |
