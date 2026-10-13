@@ -15,6 +15,11 @@ Background (from laptop review, 2026-10-08): the RaspAP install script configure
 also 2.4 GHz, and nearby => airtime contention. The Zero's brcmfmac power save is on by default. None of this has
 been confirmed on the live system yet; Step 0 does that.
 
+> **2026-10-12: this paragraph is wrong.** Step 0 found hostapd already hand-corrected (2025-08-21) to
+> `channel=1`, `ieee80211n=1`, `wmm_enabled=1`, `country_code=US`, with clients linking at 57.7-72.2 Mbit/s.
+> There is no 802.11g cap. The stale config survives only in `install_raspap_bridge.sh:195-197`, which would
+> regress the live AP if re-run. See `Results_WiFi_testing.md`.
+
 ## Rules for the agent
 
 1. **Don't cut your own internet.** Claude's API traffic goes RP5 -> Zero -> campground WiFi. Anything that
@@ -180,31 +185,16 @@ Notes:
 - Once a fix is proven, update `rv/buildRP5RaspAP/install_raspap_bridge.sh` (hostapd block) and/or
   `RPZero2WListener.py` to match, and commit.
 
-## Results
+## Results and conclusions
 
-Fill in during the run. Date / location / campground SSID / Zero signal (dBm) / Zero channel / AP channel / Roku link rate / laptop link rate:
+**Moved to [`Results_WiFi_testing.md`](Results_WiFi_testing.md)** (written 2026-10-12), which carries the
+Step 0 configuration capture, all test results, the inside-window vs outside position A/B, the recommendations
+and the open items.
 
-| Test | Run 1 | Run 2 | Run 3 | Notes |
-|------|-------|-------|-------|-------|
-| 1 AP down to laptop (Mbps) | | | | |
-| 1 AP up from laptop (Mbps) | | | | |
-| 1 AP down, 4 streams | | | | |
-| 2 USB RP5->Zero | | | | |
-| 2 USB Zero->RP5 | | | | |
-| 3 Zero down/up | | | | |
-| 4 RP5 down/up | | | | |
-| 5 Laptop at Roku (browser) | | | | |
-| 6 Zero->GW ping min/avg/max | | | | |
-| 6 RP5->Zero ping min/avg/max | | | | |
-| 7 Concurrent (AP / uplink) | | | | |
-| 8 Idle vs loaded RTT | | | | |
+Read the **Methodology warnings** section there before reusing any procedure in this plan. In short:
+`speedtest-cli` understated download by ~2.5x on this setup (use `curl` or `iperf3`); `iw` rate readings are
+meaningless on an idle link (keep a `ping` running); and `tx failed` is a lifetime counter, not a current rate.
 
-### After fixes
-
-| Fix | Tests re-run | Before | After | Keep? |
-|-----|--------------|--------|-------|-------|
-| | | | | |
-
-## Conclusion
-
-(agent: one paragraph — limiting hop, fixes applied, fixes still pending for the user)
+Status of the plan's own fix list: **C is already applied in substance, D and E should be skipped**, A/A' and B
+are confirmed applicable, and the highest-value fix found is **not in the table** (CAKE egress shaping for
+~1.3 s of upload bufferbloat). Tests 1, 5 and 7 are still unrun.
