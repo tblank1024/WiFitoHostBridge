@@ -240,6 +240,120 @@ Line 205 still sets `rsn_pairwise=CCMP`, which the live file has lost. Consider 
 | 5 | Confirm the RP5 masquerades `10.0.0.0/24` (needs sudo) — affects CAKE placement | user/agent |
 | 6 | Secure the Zero's antenna position properly; it is currently hanging outside by its USB cable | user |
 
+## WAN switch investigation (2026-10-17) — why "wired" never worked
+
+Separate from the RF work above. Raw data in `~/speed-results/*-usb-sweep/`,
+`*-usb-deep/`, `*-wired-diag/`, and `/var/log/pi5connect.log`.
+
+### Architecture, as measured
+
+Four WAN sources feed the RP5 through a **Coolgear 4-port USB switch** (the Genesys
+`05e3:0610` hub at USB path `1-2`), controlled over serial by an FT232R
+(`0403:6001`, serial `B0033FMU`) on `/dev/coolgear-hub`. Only one switch port is
+normally powered; both control endpoints are exclusive
+(`set_single_port_on` / `port_on` both send "only port N on").
+
+| Switch port | USB hub path | Device | Network seen | Config label |
+|---|---|---|---|---|
+| 1 | `1-2.1` | `cdc_ether` adapter | `192.168.0.163/24` gw `192.168.0.1`, domain `lan`, **ICMP blocked, TCP works** | `cellular` — correct |
+| 2 | `1-2.2` | Pi Zero USB gadget | `10.10.0.x` | `wifi` — correct |
+| 3 | `1-2.3` | `r8152` adapter | `206.214.239.194/24` gw `.195`, lease **16 s**, and `192.168.100.1` answers | `starlink` — correct |
+| 4 | — | **nothing attached** | — | `wired` — **wrong** |
+
+**Hub port 4 holds the FT232R that controls the switch, and is always powered** —
+it stays attached while port 2 is the active WAN. So there are three switchable
+jacks, not four, which matches the hardware: Starlink and wired share one ethernet
+adapter (you move the RJ45).
+
+### Root cause
+
+`Internet.jsx` sent **`port: 4`** for "Wired". That port has no adapter, so
+selecting Wired powered nothing. A `wired-diag` run with port 4 enabled recorded
+**zero USB events in four minutes** and no interface.
+
+This also corrects an earlier conclusion in this file: the `eth1` sightings at
+gateway `192.168.0.1` on 2026-10-06 and 10-13 were **the cellular modem**, not the
+house wire. `192.168.0.1` with domain `lan`, a locally-administered gateway MAC and
+ICMP blocked is the cellular router. The house LAN is `192.168.2.0/24` (a laptop on
+that wall port gets `192.168.2.239`).
+
+### Second bug: the dispatcher ignored `dhcp4-change`
+
+`/etc/NetworkManager/dispatcher.d/99-pi5connect` triggered only on
+`up`/`down`/`connectivity-change`. NM fires `up` as soon as the link is usable,
+which can precede DHCP returning a gateway. Measured on the cellular port:
+
+```
+11:50:42  port enabled
+11:51:18  NM "up"      -> pi5connect: "Error: cannot determine gateway for eth1."
+11:51:19  dhcp4-change -> logged as "potential uplink", NEVER acted on
+11:51:19  lease arrives (37 s after enable)
+```
+
+pi5connect never re-ran, so that WAN was never selected. It is a **race**: a fast
+lease (before `up`) works, a slow one silently fails. That explains why `eth1`
+worked on 10-05/06/13 and not otherwise. Fixed by adding `dhcp4-change`.
+
+### Third bug: the status endpoint lied
+
+`/api/debug/usb/status` called `get_current_active_port()` **inside** its per-port
+loop — 4 serial round-trips, each retrying up to 3×, to answer one question. The
+rapid queries clipped each other's replies (`Invalid hub status response length:
+FFFFF`), and a truncated read returns −1, so the API reported **every port
+`enabled: false`** while port 2 was demonstrably powered. Now queries once and
+reports `enabled: null, unknown: true` on failure instead of claiming all-off.
+
+### The FT232R control chip is failing intermittently
+
+Three failures, same signature: `error from flowcontrol urb`, then `-71`
+(`-EPROTO`) on every re-enumeration attempt including the kernel's own port power
+cycle, ending in `unable to enumerate USB device`. `over_current_count` stayed **0**
+throughout, so it is not a power trip — more likely a marginal connector or a
+failing chip.
+
+| Failure | Held for |
+|---|---|
+| 2026-10-14 17:07 | stayed dead 2.5 days |
+| 2026-10-17 07:45 | 20 min after recovery |
+| (recovered 09:22, re-enumerated on its own 09:27:30 with `failed to set flow control: -71`) | minutes |
+
+**Recovery — toggle hub port 4 only. ~11 s, no reboot, does not disturb the active WAN:**
+```bash
+P=/sys/bus/usb/devices/1-2:1.0/1-2-port4
+echo 1 | sudo tee $P/disable >/dev/null; sleep 3
+echo 0 | sudo tee $P/disable >/dev/null; sleep 8
+ls -l /dev/coolgear-hub          # expect symlink -> ttyUSB0
+```
+Verified twice. **Never reset the hub itself (`1-2`)** — that resets every port
+including the active WAN. Restarting the webserver cannot fix this: with the chip
+off the bus there is no device to open. The container's `/host-dev` is a live bind
+mount of the host `/dev`, so it sees the recovered node without a restart.
+
+### pi5connect v2.1 proved itself here
+
+With the Starlink dish in the garage (no satellite), port 3 came up with a valid
+address and a pingable gateway but no internet. v2.1 rejected it:
+
+```
+Probe FAILED: eth1 could not reach 1.1.1.1 8.8.8.8 or http://1.1.1.1/ ...
+Reject eth1: gateway reachable but no internet beyond it.
+```
+
+v2.0 would have deleted every default route and committed NAT to it. The cellular
+port is the case the TCP fallback exists for: ICMP is blocked there, but
+`http://1.1.1.1/` returns 301.
+
+### Remaining work
+
+| Item | Status |
+|---|---|
+| `Internet.jsx` Wired → port 3 | fixed, needs webserver image rebuild |
+| Dispatcher `dhcp4-change` | fixed in repo, needs deploy to `/etc/NetworkManager/dispatcher.d/` |
+| Status endpoint single query | fixed, needs image rebuild |
+| **Move the house RJ45 into port 3's adapter** | **physical, user** |
+| FT232R intermittent failure | recovery procedure documented; physical fix outstanding |
+| `EXTENDED_CONNECTION_MAPPING` | dead code (defined, never referenced) |
+
 ## Constraints that shaped this investigation
 
 The agent's uplink runs through hops 2 and 3, so anything that reconnects the Zero's WiFi would have killed the
