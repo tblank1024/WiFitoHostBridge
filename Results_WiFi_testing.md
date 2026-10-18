@@ -354,6 +354,20 @@ port is the case the TCP fallback exists for: ICMP is blocked there, but
 | FT232R intermittent failure | recovery procedure documented; physical fix outstanding |
 | `EXTENDED_CONNECTION_MAPPING` | dead code (defined, never referenced) |
 
+## Alfa AWUS036ACM bench test (2026-10-17) — see `rv/plan_new_WAN_WiFi.md`
+
+The measurements live in **`rv/plan_new_WAN_WiFi.md`, "Measured on hardware"**, alongside the integration plan
+they bear on. Not duplicated here. Headline, because it changes the RF picture above:
+
+**5 GHz beat 2.4 GHz by 10-40x on the same SSID, despite being 16 dB weaker** — 28-30 Mbps steady at -78 dBm on
+clean ch36, versus 0.7-3.5 Mbps erratic at -62 dBm on ch6, where five BSSes contend. Wired was 90.5 Mbps for
+reference. Co-channel contention dominates signal strength here, which also reframes the Zero's measured ceiling:
+being 2.4-only, it cannot escape that congested band at all.
+
+Also recorded there: `mt76x2u` binds with no driver/firmware/modeswitch work; the adapter's power LED stays dark
+until the interface is brought up (not a fault); and the Pi 5's 600 mA total USB cap (`usb_max_current_enable`
+unset) is a real constraint for a 2x2 radio under sustained transmit.
+
 ## Constraints that shaped this investigation
 
 The agent's uplink runs through hops 2 and 3, so anything that reconnects the Zero's WiFi would have killed the
