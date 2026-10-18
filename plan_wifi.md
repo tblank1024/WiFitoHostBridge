@@ -47,6 +47,8 @@ Forget.
 | `psk-flags=0` on all 9 profiles; reading a PSK needs root | `has_psk` is a proxy, never read secrets |
 | **The first `--rescan yes` after the service starts returns a short list** (2026-10-18: no `Sophie` at signal 100, 15 s after start; present on all 3 later rescans) | NM's BSS table is still filling. A cold first scan is not a parsing bug |
 | **A dual-band SSID can scan single-band**: one weak open SSID showed a 5 GHz BSS in one scan and not the next | `has_5g` is per-scan, so the `-5g` sibling is best-effort, not guaranteed |
+| **`SIGNAL` is quality 0-100, not dBm, and the curve saturates**: NM clamps at -40 dBm = 100%, so Sophie's own AP reads 100% while `iw` measures **-32 dBm** | A derived dBm is wrong at both ends of the scale. Measure with `iw`; see `README.md` |
+| `iw dev <if> link` reports the **associated** BSS, `iw dev <if> scan dump` all cached BSSes, and the dump covers fewer BSSes than nmcli lists | Status reads `link` (exact, needs no scan cache); the list reads the dump and falls back to a flagged estimate |
 | Zero has Python **3.11.2** with `http.server` | Stdlib service, no dependencies |
 | `usb0` is **unmanaged by NetworkManager** (`managed=false`), addressed by `usb0-up.service` | The RP5↔Zero control path never traverses `wlan0`. You lose internet, never control. |
 | `sudo` on the Zero needs a password for `tblank` | Deploys are one `ssh -t` with one prompt |
