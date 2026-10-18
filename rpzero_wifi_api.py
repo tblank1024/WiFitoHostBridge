@@ -70,7 +70,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from ipaddress import ip_address, ip_network
 from urllib.parse import urlparse, parse_qs
 
-SCRIPT_VERSION = "0.3.0"
+SCRIPT_VERSION = "0.3.1"
 
 # --- Configuration (all overridable from the unit's Environment=) ---
 BIND_ADDR = os.environ.get("WIFI_API_BIND", "10.10.0.1")
@@ -794,8 +794,13 @@ def key_mgmt_for(ssid, psk):
     """
     Picks key-mgmt from what the scan saw. The old listener hardcoded wpa-psk,
     which is wrong for open networks and for WPA3-only APs.
+
+    get(), not peek(), for the reason given in ssid_has_5ghz: a mutate leaves
+    the cache cold, and a cold cache here reads as security="" -- which sends
+    a WPA3-only AP down the wpa-psk path and fails the handshake. Same class of
+    bug, worse symptom, since it surfaces as a rejected password.
     """
-    networks, _ = NETWORKS_CACHE.peek()
+    networks, _ = NETWORKS_CACHE.get()
     security = ""
     for network in networks or []:
         if network["ssid"] == ssid:
@@ -811,11 +816,19 @@ def key_mgmt_for(ssid, psk):
 def ssid_has_5ghz(ssid):
     """
     Did the last scan see this SSID on 5/6 GHz? Decides whether a band-locked
-    profile is worth creating. Falls back to False when the cache is cold,
-    which only costs the 5 GHz preference on a first connect with no prior
-    scan -- the picker always scans before offering a network.
+    profile is worth creating.
+
+    get(), not peek(): every mutate invalidates NETWORKS_CACHE, so a connect
+    that follows a failed connect or a forget sees a cold cache. peek() then
+    returned False and the -5g sibling was silently skipped -- losing the band
+    preference on exactly the retry a user is most likely to make, which is
+    retyping a rejected password. Observed on hardware 2026-10-18: the first
+    connect created one profile, the second (after a scan) created the pair.
+    get() loads with rescan=False, which reads NM's existing BSS table in well
+    under a second with no radio activity, and the caller is a connect that
+    runs 20-50 s -- so it can afford a load where load_status cannot.
     """
-    networks, _ = NETWORKS_CACHE.peek()
+    networks, _ = NETWORKS_CACHE.get()
     for network in networks or []:
         if network["ssid"] == ssid:
             return bool(network.get("has_5g"))
