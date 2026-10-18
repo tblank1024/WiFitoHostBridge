@@ -55,13 +55,33 @@ devices, and a reachable API there would let any guest reconfigure the uplink.
 | Endpoint | |
 |---|---|
 | `GET /api/health` | version, uptime, ifname |
-| `GET /api/status` | state, SSID, signal and **band of the associated BSS**, IP, gateway, active profile, and the in-flight operation |
-| `GET /api/networks` | scan deduped by SSID; `?rescan=1` forces one (10 s floor). Includes `bands`, `has_5g`, `profile_count` |
+| `GET /api/status` | state, SSID, signal as both percent and **`signal_dbm`** (real RSSI, read live with `iw`), **band of the associated BSS**, IP, gateway, active profile, and the in-flight operation |
+| `GET /api/networks` | scan deduped by SSID; `?rescan=1` forces one (10 s floor). Includes `bands`, `has_5g`, `profile_count`, `signal_dbm` and `signal_dbm_estimated` |
 | `GET /api/profiles` | saved WiFi profiles with `band`, `priority`, `has_psk` |
 | `POST /api/connect` | `{ssid, psk}`. Returns 202 and a `job_id`; poll `/api/status` |
 | `POST /api/forget` | `{uuid}` for one profile, or `{ssid}` for every profile of that network. `force` required if one is active |
 
 No endpoint returns a PSK, and nmcli argv is redacted before logging.
+
+### Signal: percent and dBm
+
+`nmcli`'s `SIGNAL` is a 0-100 quality percentage, not dBm, so RSSI comes from
+`iw`: `iw dev <ifname> link` for the live association (exact, and available even
+before the first scan) and `iw dev <ifname> scan dump` per BSSID for the list.
+`scan dump` only reads what the kernel already has, so it triggers no scan and
+cannot disturb the link.
+
+NM's percentage is *not* losslessly reversible -- measured 2026-10-18 it agreed
+with `iw` within 1 dB on most BSSes but read 42% where the inverse predicts 37%
+on the associated BSS, which NM smooths. And the kernel's dump routinely covers
+fewer BSSes than `nmcli` lists, so a network's strongest BSS may have no `iw`
+reading. In that case `signal_dbm` is derived from the percentage and
+`signal_dbm_estimated` is true; the picker prefixes those with `~`.
+
+The dBm is always tied to **the same BSS the percentage describes**. Reporting
+the best reading across all of an SSID's BSSes gave better `iw` coverage but put
+-78 dBm beside 65% bars, because the dump held only the 5 GHz BSSes while the
+strongest was a 2.4 GHz one near -61.
 
 ### Profiles it creates
 

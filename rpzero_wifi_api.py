@@ -63,6 +63,7 @@ has accumulated — a long-lived service never gets there.
 
 import json
 import os
+import re
 import subprocess
 import threading
 import time
@@ -70,7 +71,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from ipaddress import ip_address, ip_network
 from urllib.parse import urlparse, parse_qs
 
-SCRIPT_VERSION = "0.3.1"
+SCRIPT_VERSION = "0.4.0"
 
 # --- Configuration (all overridable from the unit's Environment=) ---
 BIND_ADDR = os.environ.get("WIFI_API_BIND", "10.10.0.1")
@@ -489,6 +490,76 @@ def rescan_allowed():
         return True
 
 
+IW = "/usr/sbin/iw"
+
+
+def pct_to_dbm(pct):
+    """
+    NetworkManager's quality percentage back to dBm, for BSSes the kernel's
+    scan dump does not carry. NM derives the percentage from dBm with a linear
+    curve clamped at -100/-40, so the inverse is close but not exact: measured
+    2026-10-18 it agreed within 1 dB on most BSSes and was 5 dB low on the
+    associated one, which NM smooths. Estimates are flagged so the UI can mark
+    them, and the associated link never needs one -- status reads iw directly.
+    """
+    if not pct:
+        return None
+    return int(round(pct * 0.6 - 100))
+
+
+def iw_scan_dbm():
+    """
+    {BSSID: dBm} from the kernel's cached scan results.
+
+    nmcli's SIGNAL is a 0-100 quality percentage, and NetworkManager's own
+    dBm->percent curve is not reversible in practice: measured 2026-10-18, the
+    associated BSS read 42% where the linear inverse predicts 37, because NM
+    smooths the connected AP's level. So read the real RSSI instead of deriving
+    it. "scan dump" only reads what the kernel already has -- it never triggers
+    a scan, so it costs nothing and cannot disturb the link.
+
+    Best effort: returns {} if iw is missing or fails. Coverage varies, because
+    this is the kernel's latest scan for this wdev while nmcli aggregates NM's
+    longer-lived BSS table, so some BSSes nmcli lists are absent here.
+    """
+    try:
+        out = subprocess.run([IW, "dev", IFNAME, "scan", "dump"],
+                             capture_output=True, text=True, timeout=10).stdout
+    except (OSError, subprocess.SubprocessError) as exc:
+        print(f"warning: iw scan dump failed: {exc}")
+        return {}
+    levels = {}
+    bssid = ""
+    for line in out.splitlines():
+        match = re.match(r"^BSS ([0-9a-fA-F:]{17})", line)
+        if match:
+            bssid = match.group(1).upper()
+            continue
+        match = re.match(r"^\s+signal:\s*(-?[\d.]+) dBm", line)
+        if match and bssid:
+            levels[bssid] = int(round(float(match.group(1))))
+    return levels
+
+
+def iw_link_dbm():
+    """
+    The associated BSS's dBm, or None. Exact and current, where the scan cache
+    is both stale and per-SSID. "iw link" is a single netlink read of the live
+    association, so prefer it for status.
+
+    Note RSSI is the one iw reading that does not decay on an idle link (it
+    comes from beacons); its *rate* readings do -- see CLAUDE.md.
+    """
+    try:
+        out = subprocess.run([IW, "dev", IFNAME, "link"],
+                             capture_output=True, text=True, timeout=10).stdout
+    except (OSError, subprocess.SubprocessError) as exc:
+        print(f"warning: iw link failed: {exc}")
+        return None
+    match = re.search(r"^\s+signal:\s*(-?[\d.]+) dBm", out, re.M)
+    return int(round(float(match.group(1)))) if match else None
+
+
 def scan(rescan=False):
     """
     Visible networks, one entry per SSID.
@@ -498,8 +569,11 @@ def scan(rescan=False):
     with an empty SSID. Collapse by SSID keeping the strongest signal; drop the
     empty ones, which cannot be joined without manual entry.
 
-    SIGNAL is a 0-100 percentage, not dBm.
+    SIGNAL is a 0-100 percentage, not dBm, so real RSSI is merged in from
+    "iw scan dump" per BSSID. The percentage is kept: it is what the signal
+    bars render from, and it is present even when iw has no entry for a BSS.
     """
+    dbm_by_bssid = iw_scan_dbm()
     profiles = PROFILES_CACHE.get()[0]
     index = index_by_ssid(profiles)
     counts = count_by_ssid(profiles)
@@ -567,6 +641,14 @@ def scan(rescan=False):
                 # BSS's, which is the right thing to rank the picker list by
                 # and the wrong thing to report as the live link's strength.
                 "_in_use_signal": signal if in_use.strip() == "*" else 0,
+                # RSSI of the BSS the percentage above describes -- the two
+                # must agree. Taking the best reading over all of an SSID's
+                # BSSes instead looked tempting (better iw coverage) but put
+                # -78 next to 65% bars, because iw's dump held only the 5 GHz
+                # BSSes while the strongest was a 2.4 GHz one near -61.
+                "_dbm": dbm_by_bssid.get(bssid.upper()),
+                "_in_use_dbm": (dbm_by_bssid.get(bssid.upper())
+                                if in_use.strip() == "*" else None),
             }
             continue
         # Same SSID from another AP: keep the strongest, and never lose in_use.
@@ -575,10 +657,12 @@ def scan(rescan=False):
             entry["in_use"] = True
             entry["_in_use_freq"] = freq
             entry["_in_use_signal"] = signal
+            entry["_in_use_dbm"] = dbm_by_bssid.get(bssid.upper())
         entry["_bands"] |= {band_of(freq)} - {""}
         if signal > entry["signal"]:
             entry["signal"] = signal
             entry["freq"] = freq
+            entry["_dbm"] = dbm_by_bssid.get(bssid.upper())
         if label and not entry["security"]:
             entry["security"] = label
             entry["joinable"] = joinable
@@ -591,6 +675,16 @@ def scan(rescan=False):
         network["has_5g"] = bool({"5", "6"} & set(bands))
         network["in_use_band"] = band_of(network.pop("_in_use_freq"))
         network["in_use_signal"] = network.pop("_in_use_signal")
+        # Measured where iw had the BSS, else derived from NM's percentage so
+        # the list never shows a dBm that contradicts its own bars.
+        measured = network.pop("_dbm")
+        network["signal_dbm"] = (measured if measured is not None
+                                 else pct_to_dbm(network["signal"]))
+        network["signal_dbm_estimated"] = measured is None
+        in_use_measured = network.pop("_in_use_dbm")
+        network["in_use_signal_dbm"] = (
+            in_use_measured if in_use_measured is not None
+            else pct_to_dbm(network["in_use_signal"]))
     # Connected first, then known, then strongest -- what a phone does.
     networks.sort(key=lambda n: (not n["in_use"], not n["saved"],
                                  -n["signal"], n["ssid"].casefold()))
@@ -676,6 +770,10 @@ def load_status():
     # peek() never waits: get() holds its lock across a load, so a forced
     # rescan would otherwise block this endpoint for the whole scan -- measured
     # at 5.3s, while the UI polls status every 2-5s to follow a connect.
+    # Real RSSI straight from the live association: exact, current, and
+    # independent of the scan cache, which a mutate leaves empty. Falls back
+    # to the cached scan's in-use BSS, then to None.
+    signal_dbm = iw_link_dbm()
     signal = 0
     band = ""
     scan_age = None
@@ -686,6 +784,10 @@ def load_status():
                 # The associated BSS's signal, falling back to the SSID's
                 # strongest if the scan did not mark a specific BSS in use.
                 signal = network.get("in_use_signal") or network["signal"]
+                if signal_dbm is None:
+                    signal_dbm = (network.get("in_use_signal_dbm")
+                                  if network.get("in_use_signal_dbm") is not None
+                                  else network.get("signal_dbm"))
                 # Which band the uplink actually landed on -- from the
                 # associated BSS, not the strongest one. Worth surfacing: the
                 # measured penalty for being on the congested 2.4 GHz band of
@@ -701,6 +803,9 @@ def load_status():
             "state": state,
             "ssid": ssid,
             "signal": signal,
+            # Real RSSI in dBm, or null when iw could not read it. The
+            # percentage above stays for the signal bars.
+            "signal_dbm": signal_dbm,
             "band": band,
             "profile": connection,
             "profile_uuid": profile_uuid,
