@@ -12,28 +12,53 @@ Don't duplicate these; they are current and detailed.
 
 | Doc | Covers |
 |-----|--------|
-| `README.md` | Component/file map, the TCP protocol, exit codes, troubleshooting order |
+| `README.md` | Component/file map, both deployments, the HTTP API, deploy steps, troubleshooting order |
 | `plan_wifi.md` | WiFi picker plan, Phases 0–5, and a large **measured ground truth** table (nmcli quirks, root-required scanning, profile-name≠SSID). Read the table before touching nmcli parsing. |
 | `zero-system/README.md` | The Zero's system units (they exist in no other repo) + 3 known problems, incl. the unsupervised `dhcpd` strand risk |
 | `Results_WiFi_testing.md` | Throughput/RF measurements, and a **methodology-warnings** table of tools that lie |
 | `plan-speed.md` | Throughput test procedures. Tests 1, 5, 7 unrun; its Background premise is falsified |
 
-## Current direction (updated 2026-10-17)
+## Current direction (updated 2026-10-18)
 
-The Zero is being **replaced**. An Alfa AWUS036ACM (MT7612U, 2×2 dual-band) moves to the RP5, where
-it becomes one of four uplink options: wired via USB-ethernet, Starlink, cellular, and Alfa WiFi.
+The Zero has been **replaced**. An Alfa AWUS036ACM (MT7612U, 2×2 dual-band) now runs on the RP5 as
+`wlan1`, one of four uplink options alongside wired USB-ethernet, Starlink and cellular.
 
-- **`rpzero_wifi_api.py` needs no code changes for this.** `IFNAME` (line 62) comes from
-  `WIFI_IFNAME` and threads through every nmcli call. Relocating means running the same service on
-  the RP5 with `WIFI_IFNAME=wlan1`, `WIFI_API_BIND=127.0.0.1`,
-  `WIFI_API_ALLOWED_NET=127.0.0.0/8`, and `WIFI_BRIDGE_HOST=127.0.0.1` for the web server
-  (`server.py:663` already reads it from env; containers are `network_mode: host`).
+Done, on hardware:
+
+- **The adapter needed nothing.** `mt76x2u` is in the stock 6.12.96 kernel; no modeswitch, no
+  firmware package, regulatory domain already `US`. Its power LED stays dark until something brings
+  the interface up — not a fault. Measurements: `rv/plan_new_WAN_WiFi.md`, "Measured on hardware".
+- **Names are pinned by MAC** (deployed 2026-10-18, udev confirms both applied):
+  `/etc/systemd/network/10-wlan-ap.link` → `wlan0` (onboard `2c:cf:67:ab:1b:94`),
+  `11-wlan-wan.link` → `wlan1` (Alfa `00:c0:ca:be:29:62`). Needed because enumeration order can
+  swap at boot and a hub-port toggle could otherwise return the adapter as `wlan2`.
+- **`wlan0` is NM-unmanaged** via `/etc/NetworkManager/conf.d/99-unmanaged-wlan0.conf`, so hostapd
+  keeps it and nothing on the uplink path can take the AP down. Reference copies of all three files
+  live in `rv/raspap/`; no installer produces them.
+- **`rpzero_wifi_api.py` needed no interface changes.** `IFNAME` comes from `WIFI_IFNAME` and
+  threads through every nmcli call. The RP5 deployment is `wifi-api-rp5.service`
+  (`WIFI_IFNAME=wlan1`, `WIFI_API_BIND=127.0.0.1`, `WIFI_API_ALLOWED_NET=127.0.0.0/8`), with
+  `WIFI_BRIDGE_HOST=127.0.0.1` for the web server. `setup_services.sh rp5|zero` installs either and
+  refuses to run both — they would collide on 12346 and fight over one NetworkManager.
+- **`plan_wifi.md` Phase 5 is done** (2026-10-18): `RPZero2WListener.py`, both copies of
+  `RP5toRPZero2WControl.py`, `wifi-bridge-listener.service`, TCP:12345 and `/api/wifi-config` are
+  deleted. Recover with `git show 2897e46:<file>`. The copies on the Zero's SD card were never
+  removed, but the Zero was **physically disconnected from Sophie on 2026-10-18** — no `usb0`,
+  `10.10.0.1` unreachable — so it is not a live fallback and the unit cannot be disabled remotely.
+  Do that if it is ever powered up again.
+- **The picker now saves two profiles per dual-band SSID** — `<name>-5g` locked to 5 GHz at
+  autoconnect-priority 10, plus an unlocked fallback — because NM ranks BSSes by signal alone and
+  measured 10–40× slower on the stronger 2.4 GHz band. Forget therefore deletes *every* profile for
+  an SSID, not one; the picker calls it by `ssid`, not `uuid`.
 - **Keep `SELF_AP_SSID=Sophie`.** Joining the RV's own AP loops the uplink back through the RP5.
 - **Binding matters more on the RP5, not less.** The service comment warns against `0.0.0.0`
   because the Zero's `wlan0` faces a foreign network. On the RP5, `br0` carries RV guest devices,
   so a root API reachable from `br0` lets any RV WiFi client reconfigure the uplink.
-- Replacing the Zero retires `RPZero2WListener.py`, both copies of `RP5toRPZero2WControl.py`,
-  TCP:12345, and `/api/wifi-config`'s subprocess — i.e. it forces `plan_wifi.md` Phase 5.
+
+Still open: the antenna/outside mount, moving the adapter onto the hub (it is on a direct RP5 USB
+port today, and the Pi 5's 600 mA total USB cap applies — see the plan's issue 6), captive-portal
+handling in `pi5connect.sh`, and `plan_firewall.md`.
+
 - **Uplink selection already exists: `/usr/local/sbin/pi5connect.sh`** (repo: `rv/raspap/pi5connect.sh`),
   run by `/etc/NetworkManager/dispatcher.d/99-pi5connect` on every interface up/down/connectivity-change
   and by `setup-bridge.sh` at boot. It picks the WAN, sets the default route, and rewrites the NAT and
@@ -55,7 +80,6 @@ it becomes one of four uplink options: wired via USB-ethernet, Starlink, cellula
   / `channel=7` / `wmm_enabled=0`. The live `/etc/hostapd/hostapd.conf` was hand-fixed on
   2025-08-21 to 11n + WMM on channel 1 and has since lost `rsn_pairwise=CCMP` (line 205 in the
   script). Don't re-run that installer without fixing it.
-- **Two copies of `RP5toRPZero2WControl.py`** — here and `rv/webserver/server/`. Edit here, copy over.
 - **Deployed code drifts from the repo. Diff before trusting any repo copy.** Three confirmed cases:
   the live `hostapd.conf` (hand-fixed to 11n/WMM while the installer still writes 11g), `rules.v4`
   (names `eth1`; superseded at runtime by pi5connect), and `pi5connect.sh` (deployed was v2.0 while the
@@ -118,12 +142,17 @@ Established by direct comparison; see `Results_WiFi_testing.md` for the evidence
 
 ## Working on this system
 
-- **The agent's own internet goes RP5 → Zero → foreign AP.** Anything that reconnects the Zero's
-  WiFi (`nmcli con up/down`, `dev reapply`, BSSID lock, Zero reboot, `dtoverlay`) kills the session.
-  Hand those to the user. `iw ... set power_save` and `nmcli con modify` (without reactivating) are safe.
-  When adding a new uplink, give it a **higher** `ipv4.route-metric` than the live one (currently
-  `usb0` at 101) so it cannot steal the default route, test it interface-bound
-  (`curl --interface`, `ping -I`), and only then lower the metric.
+- **The agent's own internet goes out the live WAN, so losing it freezes the session.** Check
+  `/run/pi5connect-wan` and `ip route` for which interface that is right now — it has been `usb0`
+  (via the Zero), `eth1` (wired) and could be `wlan1`. Anything that reconnects *that* interface
+  (`nmcli con up/down`, `dev reapply`, BSSID lock, a reboot, `dtoverlay`) kills the session; hand
+  those to the user, and prefer a **timed auto-revert** so a mistake restores itself:
+  `sudo systemd-run --unit=netrevert --on-active=5min <restore command>`.
+  `iw ... set power_save` and `nmcli con modify` (without reactivating) are safe.
+  When adding a new uplink, give it a **higher** `ipv4.route-metric` than the live one so it cannot
+  steal the default route, test it interface-bound (`curl --interface`, `ping -I`), and only then
+  lower the metric. Note `pi5connect.sh` v2.1 also keeps a healthy incumbent WAN rather than being
+  preempted, which is a second layer of the same protection.
 - **hostapd restarts drop every WiFi client on Sophie**, possibly the user's own terminal. Back up
   the config, state the revert first, ask.
 - **No passwordless sudo on the RP5.** Most diagnostics work unprivileged (`iw`, `ip`, `ethtool`,
@@ -132,19 +161,24 @@ Established by direct comparison; see `Results_WiFi_testing.md` for the evidence
   command `sudo -n` starts working for a while and then silently stops. Don't build on it — re-check
   `sudo -n true` before a sequence that must complete, and verify a handed-off command actually landed
   (`ls -l` the target) rather than trusting "done".
-- **The Zero is `ssh zero` (user `tblank`, no passwordless sudo) and `ssh zero-root` (root).**
-  Not `pi@10.10.0.1`. Use `zero-root` for anything privileged.
-- `usb0` is **unmanaged by NetworkManager** on the Zero and statically addressed by
-  `usb0-up.service`. This is the system's best property: losing the AP or restarting NM costs
-  *internet* but never *control* — `10.10.0.1` stays reachable. Preserve it.
-- The Zero's locale is broken; set `LC_ALL=C` and filter `setlocale` noise from ssh output.
+- **The Zero is unplugged (2026-10-18) — don't try to reach it.** No `usb0`, and `10.10.0.1` does
+  not answer. If it is ever re-plugged: it is `ssh zero` (user `tblank`, no passwordless sudo) and
+  `ssh zero-root` (root), **not** `pi@10.10.0.1`; its locale is broken, so set `LC_ALL=C` and
+  filter `setlocale` noise from ssh output.
+- **The design property worth copying from the Zero:** its `usb0` was NM-unmanaged and statically
+  addressed by `usb0-up.service`, so losing the AP or restarting NM cost *internet* but never
+  *control*. The RP5 has the same split today — `br0` is independent of the uplink, so a failed
+  `wlan1` leaves the RV LAN and SSH over `br0` intact. Preserve that: never put the uplink and the
+  control path on one interface.
 - Wrap network tests in `timeout`. Save raw output under `~/speed-results/<YYYYMMDD-HHMM>/`.
 
 ## Environment
 
-- RP5: `br0` 10.0.0.1/24 (AP `Sophie` + dnsmasq), `usb0` 10.10.0.x to the Zero, `eth0` bridged into
-  `br0`, 5 GHz capable (phy0 band 2, ch36–64). Docker services per `rv/docker/docker-compose.yml`.
-- Zero: `wlan0` to the foreign AP (2.4 GHz only), `usb0` 10.10.0.1 gadget to the RP5, masquerades
-  `10.10.0.0/24` out `wlan0`. Python 3.11.2, stdlib only.
+- RP5: `br0` 10.0.0.1/24 (AP `Sophie` + dnsmasq), `eth0` bridged into `br0`, onboard `wlan0` the AP
+  radio (5 GHz capable: phy0 band 2, ch36–64), Alfa `wlan1` the WiFi uplink, `eth1` the
+  USB-ethernet uplink. Docker services per `rv/docker/docker-compose.yml`. Python 3.11.2, stdlib
+  only for the API.
+- Zero (gone since 2026-10-18, kept for reference): `wlan0` to the foreign AP (2.4 GHz only),
+  `usb0` 10.10.0.1 gadget to the RP5, masqueraded `10.10.0.0/24` out `wlan0`.
 - Upstream subnet varies by location (home `192.168.2.0/24`; campgrounds differ). Don't hardcode it.
 - RV LAN devices of note: `SophieRoku` 10.0.0.163, `TomsLaptop` 10.0.0.96.

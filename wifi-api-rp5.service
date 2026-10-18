@@ -1,0 +1,51 @@
+[Unit]
+Description=WiFi uplink HTTP API (NetworkManager, JSON on 127.0.0.1) -- RP5/Alfa
+Documentation=https://github.com/tblank1024/WiFitoHostBridge
+# The RP5 deployment of rpzero_wifi_api.py: same script as the Zero's
+# wifi-bridge-api.service, driving the Alfa USB adapter (wlan1) instead of the
+# Zero's wlan0. Only this Environment= block differs.
+#
+# No usb0-up.service dependency here: the bind address is loopback, which
+# always exists, so there is no address-not-yet-assigned race to order around.
+Wants=network-online.target
+After=network-online.target NetworkManager.service
+
+[Service]
+Type=simple
+# Root is required: as an unprivileged user, a WiFi rescan is silently ignored
+# and returns only the already-connected AP.
+User=root
+ExecStart=/usr/bin/python3 /usr/local/sbin/rpzero_wifi_api.py
+
+# Without this, Python block-buffers stdout into the journal pipe and nothing
+# appears until ~8KB has accumulated -- a long-lived service never gets there.
+Environment=PYTHONUNBUFFERED=1
+# nmcli's output is locale-dependent and this parses it.
+Environment=LC_ALL=C
+Environment=LANG=C
+
+# Loopback only. Do NOT bind 0.0.0.0, and do not bind br0 either: this is an
+# unauthenticated root "join this network" API, wlan1 sits on a foreign
+# network, and br0 carries RV guest devices -- any guest could then
+# reconfigure the uplink. The dashboard container is network_mode: host, so
+# its requests arrive from 127.0.0.1.
+Environment=WIFI_API_BIND=127.0.0.1
+Environment=WIFI_API_PORT=12346
+Environment=WIFI_API_ALLOWED_NET=127.0.0.0/8
+# The Alfa AWUS036ACM, pinned to this name by MAC in
+# /etc/systemd/network/11-wlan-wan.link. wlan0 is the RV's own AP radio and is
+# NM-unmanaged (/etc/NetworkManager/conf.d/99-unmanaged-wlan0.conf), so even a
+# misconfiguration here cannot take the AP down.
+Environment=WIFI_IFNAME=wlan1
+# The RV's own AP, broadcast by this same host on wlan0. Joining it would loop
+# the uplink straight back through the box that depends on it, so it is never
+# offered.
+Environment=SELF_AP_SSID=Sophie
+Environment=SCAN_MIN_INTERVAL=10
+EnvironmentFile=-/etc/default/wifi-api-rp5
+
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

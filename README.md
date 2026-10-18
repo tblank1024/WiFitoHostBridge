@@ -1,98 +1,145 @@
 # WiFitoHostBridge
 
-A Pi Zero 2W program (the "Zero") and a host program (the RP5) that let the Zero bridge WiFi
-traffic to the RP5 over a private subnet. The RP5 can ask the Zero to join a new SSID with a
-supplied password and is told whether it connected.
+The WiFi uplink service for the RV: a root HTTP/JSON API that drives NetworkManager so the
+dashboard can scan, join and forget networks. Scanning needs root — unprivileged, `nmcli device
+wifi list --rescan yes` silently returns only the already-connected AP — which is why this is a
+service and not dashboard code.
+
+One script, `rpzero_wifi_api.py`, with two deployments. The unit's `Environment=` block is the
+whole difference.
 
 ## Architecture
 
+**Current — the radio is on the RP5** (Alfa AWUS036ACM, `wlan1`):
+
 ```
- Internet <-- WiFi (wlan0) -- [Pi Zero 2W] -- USB/ethernet 10.10.0.x -- [RP5 / "Sophie"] -- RV LAN
-                                  ^  listener on 10.10.0.1:12345
-                                  |  TCP, one text packet per request
- RP5 web UI (Internet page) -> server.py /api/wifi-config -> RP5toRPZero2WControl.py
+ Internet <~~ 2.4/5 GHz (wlan1) ~~ [RP5 / "Sophie"] ===== br0 ===== RV LAN
+                                     ^  wifi-api-rp5.service
+                                     |  127.0.0.1:12346, root
+ dashboard (Internet page) -> server.py /api/wifi/* --'
+```
+
+`wlan0` on the RP5 is the RV's own AP (hostapd) and is NM-unmanaged, so nothing here can touch it.
+The dashboard container is `network_mode: host`, so loopback reaches the service.
+
+**Legacy — the radio on the Pi Zero 2W**, reached over the USB gadget link. **Physically
+disconnected from Sophie on 2026-10-18**, so this is history, not a live fallback: there is no
+`usb0` and `10.10.0.1` does not answer. Reviving it means re-plugging the gadget cable, then
+`setup_services.sh zero` on the Zero and `WIFI_BRIDGE_HOST=10.10.0.1` in compose. The Zero was
+1x1 and 2.4 GHz only, which is the band that measured 10–40× slower at home
+(`Results_WiFi_testing.md`).
+
+```
+ Internet <~~ 2.4 GHz (wlan0) ~~ [Pi Zero 2W] -- USB 10.10.0.x -- [RP5] == RV LAN
+                                   ^  wifi-bridge-api.service
+                                   |  10.10.0.1:12346, root
 ```
 
 | File | Runs on | Purpose |
 |------|---------|---------|
-| `RPZero2WListener.py` | Zero (as root, systemd `wifi-bridge-listener.service`, installed at `/usr/local/sbin/`) | Listens on 10.10.0.1:12345, drives `nmcli` |
-| `RP5toRPZero2WControl.py` | RP5 / laptop | Client: sends `SET_WIFI,ssid,pw` or `SET_WIFI_PROFILE,ssid,pw,profile` |
-| `diagnose_routing.sh`, `fix_interface_routing.sh` | RP5 | RaspAP routing diagnosis/repair |
+| `rpzero_wifi_api.py` | RP5 or Zero, as root at `/usr/local/sbin/` | The API. `WIFI_IFNAME` picks the radio |
+| `wifi-api-rp5.service` | RP5 | Unit for the Alfa (`wlan1`), bound to `127.0.0.1` |
+| `wifi-bridge-api.service` | Zero | Unit for the Zero (`wlan0`), bound to `10.10.0.1` |
+| `setup_services.sh` | either | Installs script + unit; `rp5` or `zero` |
+| `zero-system/` | Zero | The Zero's own system units (`usb0-up`, `dhcpd`, …) — see its README |
 
-**Two copies of the client exist:** this one and `rv/webserver/server/RP5toRPZero2WControl.py`
-(copied into the Docker image). Keep them identical; edit here, then copy.
+The dashboard side lives in the `rv` repo: `webserver/server/server.py` (`/api/wifi/*` proxy,
+`WIFI_BRIDGE_HOST` selects the deployment) and `webserver/client/src/page-internet/`.
 
-## Protocol / exit codes
+## The HTTP API (port 12346)
 
-Listener is single-threaded and handles one request at a time. A request takes up to ~70 s
-(delete + add profile, `nmcli up`, then up to 45 s waiting for an IP).
+Unauthenticated; **the bind address is the only access control.** Never bind `0.0.0.0`. On the RP5
+this matters more, not less: besides the foreign network on `wlan1`, `br0` carries RV guest
+devices, and a reachable API there would let any guest reconfigure the uplink.
 
-| Exit | Meaning | What to do |
-|------|---------|-----------|
-| 0 | Connected, profile saved | Done |
-| 1 | General failure; the message printed just before says which (unreachable, no answer, nmcli add/activate failed, bad packet) | See Troubleshooting |
-| 100 | Password rejected (profile saved) | Resend with correct password |
-| 101 | Profile saved but no IP before timeout | Check SSID spelling, range, 2.4 GHz only, DHCP |
+| Endpoint | |
+|---|---|
+| `GET /api/health` | version, uptime, ifname |
+| `GET /api/status` | state, SSID, signal and **band of the associated BSS**, IP, gateway, active profile, and the in-flight operation |
+| `GET /api/networks` | scan deduped by SSID; `?rescan=1` forces one (10 s floor). Includes `bands`, `has_5g`, `profile_count` |
+| `GET /api/profiles` | saved WiFi profiles with `band`, `priority`, `has_psk` |
+| `POST /api/connect` | `{ssid, psk}`. Returns 202 and a `job_id`; poll `/api/status` |
+| `POST /api/forget` | `{uuid}` for one profile, or `{ssid}` for every profile of that network. `force` required if one is active |
 
-Timeouts (client): 10 s to connect, 90 s waiting for the answer. The web server
-(`server.py` `/api/wifi-config`) allows 120 s. These must stay larger than the listener's worst case;
-the old 30 s web limit caused "timed out after 30 sec" even when the Zero was fine.
+No endpoint returns a PSK, and nmcli argv is redacted before logging.
 
-## Using it
+### Profiles it creates
 
-From the RV web UI: Internet page -> WiFi Configuration. Expect up to ~70 s of waiting.
+A dual-band SSID gets **two** profiles: `<name>-5g` locked to 5 GHz at autoconnect-priority 10,
+and `<name>` unlocked at priority 0. NetworkManager ranks BSSes by signal strength alone and that
+is the wrong metric — measured 2026-10-17, it chose 2.4 GHz at −62 dBm over 5 GHz at −78 dBm, and
+the band it chose was 10–40× slower because five networks shared the 2.4 GHz channel. NM has no
+band *preference*, only a band lock, and a locked profile fails outright where that band is
+absent — hence the unlocked fallback, which `connect` also falls back to if the 5 GHz BSS has gone
+since the scan.
 
-From a shell on the RP5 (or the Docker container):
+A network **already saved** as a single unlocked profile is not restructured on connect — the API
+hardens it but does not add a sibling, so it keeps whatever band NM picks. To upgrade one by hand:
+
+```bash
+sudo nmcli con add type wifi ifname wlan1 con-name "<name>-5g" ssid "<ssid>" -- \
+  802-11-wireless-security.key-mgmt wpa-psk 802-11-wireless-security.psk '<psk>' \
+  802-11-wireless.band a connection.autoconnect-priority 10 \
+  802-11-wireless.powersave 2 802-11-wireless.cloned-mac-address permanent ipv6.method disabled
 ```
-python RP5toRPZero2WControl.py                      # interactive
-python RP5toRPZero2WControl.py "My SSID" "pw"       # default profile ListenerManagedWifi
-python RP5toRPZero2WControl.py "My SSID" "pw" Name  # named (permanent) profile
+
+Every profile it creates or activates gets `802-11-wireless.powersave 2` (off),
+`cloned-mac-address permanent` (a captive portal authorizes a MAC; a random one per connection
+means logging in again every time) and `ipv6.method disabled` (a park network's SLAAC address
+would bypass the v4-only firewall rules).
+
+## Deploying
+
+```bash
+sudo ./setup_services.sh rp5      # on the RP5, for the Alfa
+sudo ./setup_services.sh zero     # on the Zero  [legacy]
 ```
-Host/port override: env `WIFI_BRIDGE_HOST`, `WIFI_BRIDGE_PORT` (defaults 10.10.0.1 / 12345).
+
+It refuses to install one while the other unit is enabled — they would collide on port 12346 and
+both drive the same NetworkManager. Then point the dashboard at the live one in
+`rv/docker/docker-compose.yml` (`WIFI_BRIDGE_HOST=127.0.0.1` or `10.10.0.1`) and
+`docker compose up -d webserver`.
+
+Bump `SCRIPT_VERSION`: it is logged at start-up, so `journalctl` confirms which code is running.
+Restarting the service never disturbs the uplink — NetworkManager owns the radio independently of
+this process. A `connect` *does*, so don't test one from a session that depends on that uplink.
 
 ## Troubleshooting (in order)
 
-1. **Can the RP5 reach the Zero?** `ping 10.10.0.1` and `nc -vz 10.10.0.1 12345` from the RP5.
-   Fails -> Zero off/not booted, link down, or service not running.
-2. **Is the listener running?** On the Zero: `sudo systemctl status wifi-bridge-listener`
-   (restart: `sudo systemctl restart wifi-bridge-listener`).
-3. **What did the listener do?** `sudo journalctl -u wifi-bridge-listener -n 100`. It logs every
-   nmcli command and each status poll. Look for the last "Final connection status" line.
-4. **Does nmcli work by hand?** On the Zero: `nmcli device wifi list` (is the SSID visible? Zero 2W is
-   2.4 GHz only), `nmcli connection show`, `sudo nmcli connection up ListenerManagedWifi`.
-5. **Bad profile left behind?** `sudo nmcli connection delete ListenerManagedWifi` and retry.
-6. Password must be 8-63 chars for WPA-PSK; open networks are not supported (listener always sets wpa-psk).
+1. **Is the service up?** `systemctl status wifi-api-rp5` (or `wifi-bridge-api` on the Zero).
+2. **Does it answer?** `curl -s http://127.0.0.1:12346/api/health` (`10.10.0.1` for the Zero).
+   The dashboard's error message names the address it tried.
+3. **What did it do?** `journalctl -u wifi-api-rp5 -n 100`. Every nmcli command is logged
+   (redacted), with the phase of each connect.
+4. **Does nmcli work by hand?** `nmcli device wifi list ifname wlan1`, `nmcli connection show`.
+   A rescan as a non-root user returns only the connected AP — that is expected, not a fault.
+5. **Right interface?** `/api/health` reports `ifname`. On the RP5 the Alfa is pinned to `wlan1`
+   by MAC in `/etc/systemd/network/11-wlan-wan.link`; `wlan0` is the AP and must stay NM-unmanaged
+   (`nmcli dev status`).
+6. **Bad profile left behind?** `/api/profiles`, then `POST /api/forget` with its `uuid`. A failed
+   connect deletes the profiles it created, so a leftover means the delete failed — the journal
+   says so.
+7. Password must be 8–63 chars for WPA-PSK. Open and WPA3 networks are handled; 802.1X is not.
 
-Note: the client does not resend after the packet is delivered. Earlier versions retried on a
-10 s read timeout, which queued duplicate requests behind the still-running first one.
+## The retired socket path
 
-## Development workflow
+`RPZero2WListener.py`, `RP5toRPZero2WControl.py` (both copies), the `wifi-bridge-listener.service`
+unit, TCP:12345 and the dashboard's `/api/wifi-config` were removed on 2026-10-18 — `plan_wifi.md`
+Phase 5. The protocol could not carry a list (requests were comma-split, so an SSID with a comma
+was unparseable, and both ends did one unframed `recv(1024)`, which a 12–18 AP scan overflows).
 
-The problem: Claude Code needs internet; the RP5/Zero are on the private RV network.
-Pick one:
+The CLI was kept in earlier plans as an emergency path, on the grounds that it worked when the
+dashboard was down. That stopped being true: it needed the listener service running, and with the
+radio on the RP5 the real emergency path is plain `sudo nmcli dev wifi connect` on the host.
 
-**A. Edit on the laptop (internet), run on the RP5 over SSH (recommended).**
-Laptop stays on normal internet. Reach the RP5 at `192.168.2.196` when home/ethernet-connected
-(see `~/.ssh/config`). Edit files locally with Claude, then `scp` or `git push` / `git pull` on
-the RP5, restart the service/container. Use SSH from the RP5 to the Zero (`ssh zero`, i.e. tblank@10.10.0.1) to
-see the listener logs. The RP5 is the jump host; the laptop never needs to be on 10.10.0.x.
-From the RP5, `ssh zero` is configured in `~/.ssh/config` (user `tblank`, key
-`~/.ssh/id_ed25519_zero`); the account is `tblank`, not `pi`.
+Recover any of them from git if the Zero is ever brought back:
+`git show 2897e46:RPZero2WListener.py`. The copies installed on the Zero's own SD card under
+`/usr/local/sbin/` were never removed — the Zero was unplugged before anyone disabled the unit, so
+if it is ever powered up again the listener will start. Disable it then
+(`systemctl disable --now wifi-bridge-listener`), not before: it is unreachable now.
 
-**B. Samba mount of the RP5 code** (see `~/dotfiles/claude/CLAUDE-laptop.md`, "Remote Machine
-Access"): edit live files natively from the laptop while it stays on internet.
+## Working on this code
 
-**Avoid** joining the laptop to the Zero's/RV network just to test: you lose internet for Claude.
-Test through the RP5 instead.
-
-Deploying changes:
-- Listener (on Zero): `scp RPZero2WListener.py zero:/tmp/` then
-  `ssh -t zero 'sudo cp /tmp/RPZero2WListener.py /usr/local/sbin/ && sudo systemctl restart wifi-bridge-listener'`
-  (`-t`: sudo on the Zero prompts for a password).
-  Restarting the listener does not disturb the uplink -- it only drops the control
-  socket; NetworkManager keeps wlan0 and the USB link up. Sending SET_WIFI *does*
-  risk the uplink, so do not test a reconfiguration from a session that depends on it.
-  Bump `SCRIPT_VERSION`; it is logged at start-up so you can confirm the new code is running.
-- Client / web server (on RP5): `cd rv/docker && docker compose up -d --build webserver`.
-- Service unit: `wifi-bridge-listener.service` -> `/etc/systemd/system/`, then
-  `sudo systemctl daemon-reload && sudo systemctl enable --now wifi-bridge-listener`.
+See `CLAUDE.md` for the traps that cost time (interface naming, which uplink is which, the Coolgear
+hub's control chip, and the measurement tools that lie). `plan_wifi.md` carries the measured
+ground-truth table for nmcli's quirks — read it before touching the parsing.

@@ -169,7 +169,7 @@ airtime => 5 GHz AP helps.
 | Fix | Who | How | Revert | Re-run |
 |-----|-----|-----|--------|--------|
 | A. Zero power save off (runtime) | agent | `ssh pi@10.10.0.1 'sudo iw dev wlan0 set power_save off'` | `... power_save on` | 3, 6, (5) |
-| A'. Make A persistent | agent | `sudo nmcli con modify <profile> 802-11-wireless.powersave 2` (do **not** reactivate; applies on next connect). Also patch `RPZero2WListener.py` add command | `... powersave 0` | — |
+| A'. Make A persistent | agent | `sudo nmcli con modify <profile> 802-11-wireless.powersave 2` (do **not** reactivate; applies on next connect) | `... powersave 0` | — |
 | B. Zero Bluetooth off | [USER] (Zero reboot drops this session) | add `dtoverlay=disable-bt` to Zero `/boot/firmware/config.txt`, reboot Zero | remove line, reboot | 3, 6 |
 | C. AP 11n on 2.4 GHz | agent after asking | back up `/etc/hostapd/hostapd.conf`; set `ieee80211n=1`, `wmm_enabled=1`, `ht_capab=[SHORT-GI-20]`, `country_code=US`, `rsn_pairwise=CCMP`, channel 5+ away from the Zero's; `sudo systemctl restart hostapd` | restore backup, restart | 1, 5, 7 |
 | D. AP on 5 GHz | agent after asking; confirm the Roku model is dual-band first | `hw_mode=a`, `channel=36`, `ieee80211n=1`, `ieee80211ac=1`, `wmm_enabled=1`, `ht_capab=[HT40+][SHORT-GI-20][SHORT-GI-40]`, `vht_oper_chwidth=1`, `vht_oper_centr_freq_seg0_idx=42`, `country_code=US`, `ieee80211d=1` | restore backup, restart | 1, 5, 7 |
@@ -182,8 +182,9 @@ Notes:
   start, revert immediately, since the RV has no WiFi until you do.
 - A hostapd restart drops the laptop too. Before re-running Test 1, ask the user to confirm the laptop rejoined
   Sophie WiFi (on 5 GHz after D) and that `iperf3 -s` is still running; re-check `<LAPTOP>` (DHCP may change it).
-- Once a fix is proven, update `rv/buildRP5RaspAP/install_raspap_bridge.sh` (hostapd block) and/or
-  `RPZero2WListener.py` to match, and commit.
+- Once a fix is proven, update `rv/buildRP5RaspAP/install_raspap_bridge.sh` (hostapd block) to match,
+  and commit. Fix A' is now permanent in code: `rpzero_wifi_api.py`'s `PROFILE_HARDENING` puts
+  `802-11-wireless.powersave 2` on every profile it creates or activates (2026-10-18).
 
 ## Results and conclusions
 

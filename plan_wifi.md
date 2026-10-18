@@ -1,5 +1,9 @@
 # Plan: conventional WiFi picker for the Pi Zero uplink
 
+STATUS: **Phases 0-5 done.** Phase 5 completed 2026-10-18, and the service has since moved off the
+Zero onto the RP5's Alfa adapter (`WIFI_IFNAME=wlan1`) — see `rv/plan_new_WAN_WiFi.md`. The phase
+text below is the record of what was planned; Phase 5 notes where it was deviated from.
+
 ## Context
 
 The RV's internet can arrive through the USB-attached Pi Zero 2W ("the Zero", hostname `RP2W`)
@@ -41,6 +45,8 @@ Forget.
 | Zero sees the RV's own AP **`Sophie`** (RP5 `/etc/hostapd/hostapd.conf:7`) at signal 57 | Joining it loops the uplink through the RP5 — block it both ends |
 | Scan has duplicate SSIDs across BSSIDs (3× `tellMyWIFILoveHer`) and one empty-SSID hidden AP; SIGNAL is 0–100 | Dedupe by SSID keeping max signal; drop empty SSIDs |
 | `psk-flags=0` on all 9 profiles; reading a PSK needs root | `has_psk` is a proxy, never read secrets |
+| **The first `--rescan yes` after the service starts returns a short list** (2026-10-18: no `Sophie` at signal 100, 15 s after start; present on all 3 later rescans) | NM's BSS table is still filling. A cold first scan is not a parsing bug |
+| **A dual-band SSID can scan single-band**: one weak open SSID showed a 5 GHz BSS in one scan and not the next | `has_5g` is per-scan, so the `-5g` sibling is best-effort, not guaranteed |
 | Zero has Python **3.11.2** with `http.server` | Stdlib service, no dependencies |
 | `usb0` is **unmanaged by NetworkManager** (`managed=false`), addressed by `usb0-up.service` | The RP5↔Zero control path never traverses `wlan0`. You lose internet, never control. |
 | `sudo` on the Zero needs a password for `tblank` | Deploys are one `ssh -t` with one prompt |
@@ -193,14 +199,24 @@ page folder is the convention. In `Internet.jsx`, replace lines 576-690 with
 - The output `TextArea` keeps its affordance but changes content: client-timestamped one-liners
   derived from status transitions, collapsed behind an "Activity log" toggle.
 
-## Phase 5 — retire the old path
+## Phase 5 — retire the old path — DONE 2026-10-18
 
-Only after a week of real use and a successful Zero reboot test. Delete `/api/wifi-config`
-(567-640) and its models; delete `rv/webserver/server/RP5toRPZero2WControl.py` and its `COPY` line
-(`webserver/Dockerfile:71`); swap `WIFI_BRIDGE_PORT=12345` for `WIFI_BRIDGE_API_PORT=12346` in
-compose. **Keep** `WifitoHostBridge/RP5toRPZero2WControl.py` as the emergency CLI — the only tool
-that works if both the new service and docker are down. `systemctl disable --now
-wifi-bridge-listener` on the Zero, leaving the files installed as the documented fallback.
+Done as planned: `/api/wifi-config` and its `WiFiConfigData`/`WiFiConfigResponse` models deleted
+from `server.py`, `rv/webserver/server/RP5toRPZero2WControl.py` and its `COPY` line
+(`webserver/Dockerfile:71`) deleted, `WIFI_BRIDGE_PORT=12345` dropped from compose.
+
+**Deviation: `WifitoHostBridge/RP5toRPZero2WControl.py` was deleted too, not kept.** The reason for
+keeping it — "the only tool that works if both the new service and docker are down" — was not
+actually true: the CLI speaks to `RPZero2WListener.py`, so it needs a service of its own running,
+and this phase disables that service. With the radio now on the RP5 (the Alfa, `wlan1`) the real
+emergency path is `sudo nmcli dev wifi connect` on the host itself, which needs nothing running.
+`RPZero2WListener.py` and `wifi-bridge-listener.service` went with it; recover any of them with
+`git show 2897e46:<file>`.
+
+The Zero was **physically disconnected from Sophie on 2026-10-18**, before anyone ran
+`systemctl disable --now wifi-bridge-listener` on it, so the installed copies under
+`/usr/local/sbin/` are still enabled on its SD card. It is unreachable, so this cannot be done
+remotely — do it if the Zero is ever powered up again.
 
 ## Verification
 

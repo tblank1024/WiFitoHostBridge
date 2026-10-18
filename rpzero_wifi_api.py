@@ -1,27 +1,43 @@
 #!/usr/bin/env python3
 """
-WiFi bridge HTTP API — runs on the Pi Zero 2W ("the Zero"), as root.
+WiFi bridge HTTP API — runs as root on whichever host owns the uplink radio.
+
+Two deployments, same code; the unit's Environment= block is the whole
+difference (see wifi-bridge-api.service for the Zero, wifi-api-rp5.service for
+the RP5):
+
+  * Pi Zero 2W ("the Zero"): WIFI_IFNAME=wlan0, bound to 10.10.0.1, the USB
+    link to the RP5.  Being retired.
+  * RP5 ("Sophie") with the Alfa USB adapter: WIFI_IFNAME=wlan1, bound to
+    127.0.0.1.  wlan0 there is the RV's own AP and is NM-unmanaged, so nothing
+    here can touch it.
 
 Why this exists
 ---------------
-The RP5's dashboard needs to show the networks the Zero can see, with signal
-strength, and which of them the Zero already has credentials for. Scanning
+The RP5's dashboard needs to show the networks the uplink radio can see, with
+signal strength, and which of them already have stored credentials. Scanning
 requires root (as an unprivileged user, `nmcli device wifi list --rescan yes`
 silently returns only the connected AP), so the privileged work has to live in a
 service like this one.
 
-It replaces the comma-delimited socket protocol of RPZero2WListener.py, which
-cannot carry a list: requests were split on commas (so an SSID containing a
-comma was unparseable) and both ends did a single unframed recv(1024), which a
-12-18 AP scan result overflows.
+It replaced a comma-delimited socket protocol (RPZero2WListener.py, deleted
+2026-10-18) that could not carry a list: requests were split on commas, so an
+SSID containing a comma was unparseable, and both ends did a single unframed
+recv(1024), which a 12-18 AP scan result overflows.
 
 Exposure
 --------
-Bound to 10.10.0.1 only — the point-to-point USB link to the RP5 — and requests
-from outside 10.10.0.0/24 are refused. This matters: the Zero's wlan0 sits on a
-foreign network (campground, marina), and binding 0.0.0.0 would publish a
-root-privileged "join this network" API to it. There is no authentication, in
-keeping with the RP5 dashboard it serves; the bind address is the control.
+The bind address is the only access control; there is no authentication, in
+keeping with the RP5 dashboard this serves. Binding 0.0.0.0 would publish a
+root-privileged "join this network" API, so don't.
+
+  * On the Zero: 10.10.0.1, the point-to-point USB link, with 10.10.0.0/24
+    allowed. Its wlan0 faces a foreign network (campground, marina).
+  * On the RP5: 127.0.0.1 with 127.0.0.0/8 allowed. Binding matters MORE here,
+    not less — besides the foreign network on wlan1, br0 carries RV guest
+    devices, and a reachable API there lets any RV WiFi client reconfigure the
+    uplink. The dashboard container is network_mode: host, so loopback reaches
+    it.
 
 Secrets
 -------
@@ -29,13 +45,13 @@ Passwords are never logged. nmcli argv is redacted before printing, and no
 endpoint returns a PSK — `has_psk` is derived from psk-flags, so the secret is
 never read in the first place.
 
-Phase 1 implements the read-only endpoints:
-    GET /api/health      version and uptime
-    GET /api/status      wlan0 state, SSID, signal, IP, active profile
-    GET /api/networks    scan results, deduped by SSID   (?rescan=1 to force)
-    GET /api/profiles    saved WiFi profiles, with has_psk
-
-POST /api/connect and /api/forget answer 501 until Phase 3.
+Endpoints:
+    GET  /api/health     version and uptime
+    GET  /api/status     interface state, SSID, signal, IP, active profile
+    GET  /api/networks   scan results, deduped by SSID   (?rescan=1 to force)
+    GET  /api/profiles   saved WiFi profiles, with has_psk
+    POST /api/connect    join an SSID (async; poll /api/status)
+    POST /api/forget     delete the saved profile(s) for an SSID
 
 Logs
 ----
@@ -54,14 +70,15 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from ipaddress import ip_address, ip_network
 from urllib.parse import urlparse, parse_qs
 
-SCRIPT_VERSION = "0.2.3"
+SCRIPT_VERSION = "0.3.0"
 
 # --- Configuration (all overridable from the unit's Environment=) ---
 BIND_ADDR = os.environ.get("WIFI_API_BIND", "10.10.0.1")
 BIND_PORT = int(os.environ.get("WIFI_API_PORT", "12346"))
 IFNAME = os.environ.get("WIFI_IFNAME", "wlan0")
-# The RV's own AP, broadcast by the RP5. Joining it would route the Zero's
-# uplink back through the RP5 that depends on the Zero. Never offered.
+# The RV's own AP, broadcast by the RP5 on wlan0. Joining it would loop the
+# uplink back through the RP5 that depends on it. Never offered -- and it is
+# visible in every scan from either host, so this is not optional.
 SELF_AP_SSID = os.environ.get("SELF_AP_SSID", "Sophie")
 ALLOWED_NET = ip_network(os.environ.get("WIFI_API_ALLOWED_NET", "10.10.0.0/24"))
 # Floor between real rescans, however often the UI asks. A rescan while
@@ -77,6 +94,32 @@ MAX_BODY_BYTES = 4096
 # --- End configuration ---
 
 WIFI_TYPE = "802-11-wireless"
+
+# Settings put on every profile this API creates.
+#   powersave 2 = off.  A dozing uplink costs latency and throughput, and
+#     NetworkManager's default is driver-dependent.
+#   cloned-mac-address permanent = use the adapter's real MAC, not a random
+#     one per connection.  A captive portal authorizes a MAC; a new MAC on
+#     every reconnect means logging in again every time.
+#   ipv6.method disabled = a park network offering SLAAC would give the uplink
+#     a global v6 address, which bypasses the v4-only firewall rules entirely.
+PROFILE_HARDENING = (
+    "802-11-wireless.powersave", "2",
+    "802-11-wireless.cloned-mac-address", "permanent",
+    "ipv6.method", "disabled",
+)
+
+# Dual-band SSIDs get two profiles: a 5 GHz-locked one at a higher autoconnect
+# priority, and an unlocked fallback.  NetworkManager ranks BSSes by signal
+# strength alone, and that is the wrong metric -- measured 2026-10-17 at home,
+# it chose 2.4 GHz at -62 dBm over 5 GHz at -78 dBm and the band it picked was
+# 10-40x slower, because five networks shared the 2.4 GHz channel.  A clean
+# weak channel beats a strong congested one.  The lock has to be explicit
+# because NM has no band *preference*, only a band lock, and a locked profile
+# fails outright where that band is absent -- hence the unlocked fallback.
+FIVE_GHZ_SUFFIX = "-5g"
+FIVE_GHZ_PRIORITY = "10"
+
 START_MONOTONIC = time.monotonic()
 
 
@@ -299,17 +342,21 @@ def load_profiles():
             props = nmcli_props(
                 uuid,
                 "802-11-wireless.ssid",
+                "802-11-wireless.band",
                 "802-11-wireless-security.key-mgmt",
                 "802-11-wireless-security.psk-flags",
                 "connection.autoconnect",
+                "connection.autoconnect-priority",
             )
         except NmcliError as exc:
             print(f"warning: skipping profile {uuid}: {exc}")
             continue
         ssid = props.get("802-11-wireless.ssid", "")
+        band = props.get("802-11-wireless.band", "")
         key_mgmt = props.get("802-11-wireless-security.key-mgmt", "")
         psk_flags = props.get("802-11-wireless-security.psk-flags", "")
         autoconnect = props.get("connection.autoconnect", "")
+        priority_raw = props.get("connection.autoconnect-priority", "")
 
         secured = key_mgmt not in ("", "none")
         profiles.append({
@@ -325,6 +372,9 @@ def load_profiles():
             "key_mgmt": key_mgmt,
             "timestamp": int(timestamp) if timestamp.isdigit() else 0,
             "autoconnect": autoconnect == "yes",
+            # nmcli prints "--" for an unset band; "a" = 5 GHz, "bg" = 2.4.
+            "band": "" if band in ("--", "(null)") else band,
+            "priority": int(priority_raw) if priority_raw.lstrip("-").isdigit() else 0,
             "active": uuid in active_uuids,
         })
 
@@ -332,22 +382,37 @@ def load_profiles():
     return profiles
 
 
+def profile_rank(profile):
+    """
+    How NetworkManager itself would order candidate profiles for one SSID:
+    autoconnect-priority first, then the most recently used, then by name.
+    Name is the final tiebreak because several profiles here have timestamp 0
+    and nmcli's output order is not guaranteed.
+    """
+    return (profile["priority"], profile["timestamp"], profile["name"])
+
+
 def index_by_ssid(profiles):
     """
-    SSID -> best profile. NetworkManager breaks autoconnect-priority ties by
-    timestamp, so preferring the newest-used profile matches what NM itself
-    would pick. Name is the tiebreak, because several profiles here have
-    timestamp 0 and nmcli's output order is not guaranteed.
+    SSID -> the profile NM would prefer. With the 5 GHz/fallback pair this API
+    creates, that is the band-locked one, which is the point of the pair.
     """
     index = {}
     for profile in profiles:
         if not profile["ssid"]:
             continue
         best = index.get(profile["ssid"])
-        key = (profile["timestamp"], profile["name"])
-        if best is None or key > (best["timestamp"], best["name"]):
+        if best is None or profile_rank(profile) > profile_rank(best):
             index[profile["ssid"]] = profile
     return index
+
+
+def profiles_for_ssid(profiles, ssid):
+    """Every profile for one SSID -- the band pair, and any older duplicates
+    -- in the order NetworkManager would prefer them."""
+    matches = [p for p in profiles if p["ssid"] == ssid]
+    matches.sort(key=profile_rank, reverse=True)
+    return matches
 
 
 def count_by_ssid(profiles):
@@ -361,6 +426,25 @@ def count_by_ssid(profiles):
 # ---------------------------------------------------------------------------
 # Scanning
 # ---------------------------------------------------------------------------
+
+def band_of(freq):
+    """
+    nmcli's FREQ field ("2437 MHz") -> "2.4" | "5" | "6", or "" if unparseable.
+    5 and 6 GHz are reported separately but share NetworkManager's band lock
+    value "a", so callers treat both as "the 5 GHz-ish band".
+    """
+    head = freq.strip().split(" ")[0] if freq.strip() else ""
+    if not head.isdigit():
+        return ""
+    mhz = int(head)
+    if 2400 <= mhz < 2500:
+        return "2.4"
+    if 4900 <= mhz < 5925:
+        return "5"
+    if 5925 <= mhz <= 7125:
+        return "6"
+    return ""
+
 
 def normalize_security(raw):
     """
@@ -423,7 +507,8 @@ def scan(rescan=False):
     out = nmcli(
         "-t", "-f", "IN-USE,SSID,SIGNAL,SECURITY,BSSID,FREQ",
         "device", "wifi", "list",
-        # Pin the interface: this Zero also has a p2p-dev-wlan0.
+        # Pin the interface. Both hosts carry a p2p-dev-<ifname> alongside the
+        # real one, and on the RP5 wlan0 is the RV's own AP radio.
         "ifname", IFNAME,
         "--rescan", "yes" if rescan else "no",
     )
@@ -467,11 +552,30 @@ def scan(rescan=False):
                 "profile_count": counts.get(ssid, 0),
                 "bssid_count": 1,
                 "freq": freq,
+                # Every band this SSID was seen on, not just the strongest
+                # BSS's.  The strongest BSS is routinely the 2.4 GHz one while
+                # the 5 GHz BSS is the one worth joining, so "freq" alone
+                # cannot answer "is this network dual-band?".
+                "_bands": {band_of(freq)} - {""},
+                # The frequency of the BSS actually associated, which is NOT
+                # "freq" above: that is the strongest BSS, and on a dual-band
+                # SSID the strongest is routinely the 2.4 GHz one while the
+                # association is on 5 GHz. Reporting "freq" as the live band
+                # said 2.4 GHz for a 5 GHz-locked profile.
+                "_in_use_freq": freq if in_use.strip() == "*" else "",
+                # Same reasoning for signal: "signal" above is the strongest
+                # BSS's, which is the right thing to rank the picker list by
+                # and the wrong thing to report as the live link's strength.
+                "_in_use_signal": signal if in_use.strip() == "*" else 0,
             }
             continue
         # Same SSID from another AP: keep the strongest, and never lose in_use.
         entry["bssid_count"] += 1
-        entry["in_use"] = entry["in_use"] or in_use.strip() == "*"
+        if in_use.strip() == "*":
+            entry["in_use"] = True
+            entry["_in_use_freq"] = freq
+            entry["_in_use_signal"] = signal
+        entry["_bands"] |= {band_of(freq)} - {""}
         if signal > entry["signal"]:
             entry["signal"] = signal
             entry["freq"] = freq
@@ -481,6 +585,12 @@ def scan(rescan=False):
             entry["unjoinable_reason"] = reason
 
     networks = list(merged.values())
+    for network in networks:
+        bands = sorted(network.pop("_bands"))
+        network["bands"] = bands
+        network["has_5g"] = bool({"5", "6"} & set(bands))
+        network["in_use_band"] = band_of(network.pop("_in_use_freq"))
+        network["in_use_signal"] = network.pop("_in_use_signal")
     # Connected first, then known, then strongest -- what a phone does.
     networks.sort(key=lambda n: (not n["in_use"], not n["saved"],
                                  -n["signal"], n["ssid"].casefold()))
@@ -521,7 +631,7 @@ def job_snapshot():
 
 
 def load_status():
-    """wlan0's state, the AP it is on, its address, and the active profile."""
+    """IFNAME's state, the AP it is on, its address, and the active profile."""
     state = "unknown"
     connection = ""
     try:
@@ -567,12 +677,21 @@ def load_status():
     # rescan would otherwise block this endpoint for the whole scan -- measured
     # at 5.3s, while the UI polls status every 2-5s to follow a connect.
     signal = 0
+    band = ""
     scan_age = None
     networks, scan_age = NETWORKS_CACHE.peek()
     if networks:
         for network in networks:
             if network["in_use"] and (not ssid or network["ssid"] == ssid):
-                signal = network["signal"]
+                # The associated BSS's signal, falling back to the SSID's
+                # strongest if the scan did not mark a specific BSS in use.
+                signal = network.get("in_use_signal") or network["signal"]
+                # Which band the uplink actually landed on -- from the
+                # associated BSS, not the strongest one. Worth surfacing: the
+                # measured penalty for being on the congested 2.4 GHz band of
+                # a dual-band SSID was 10-40x, and signal strength alone gives
+                # no hint of it.
+                band = network.get("in_use_band", "")
                 if not ssid:
                     ssid = network["ssid"]
                 break
@@ -582,6 +701,7 @@ def load_status():
             "state": state,
             "ssid": ssid,
             "signal": signal,
+            "band": band,
             "profile": connection,
             "profile_uuid": profile_uuid,
             "ip": ip,
@@ -688,6 +808,56 @@ def key_mgmt_for(ssid, psk):
     return "wpa-psk"
 
 
+def ssid_has_5ghz(ssid):
+    """
+    Did the last scan see this SSID on 5/6 GHz? Decides whether a band-locked
+    profile is worth creating. Falls back to False when the cache is cold,
+    which only costs the 5 GHz preference on a first connect with no prior
+    scan -- the picker always scans before offering a network.
+    """
+    networks, _ = NETWORKS_CACHE.peek()
+    for network in networks or []:
+        if network["ssid"] == ssid:
+            return bool(network.get("has_5g"))
+    return False
+
+
+def add_profile(name, ssid, key_mgmt, psk, band=""):
+    """
+    Creates one profile and returns its uuid. `band` is NetworkManager's
+    802-11-wireless.band ("a" to lock to 5/6 GHz, "" for any band).
+    """
+    args = ["connection", "add", "type", "wifi", "con-name", name,
+            "ifname", IFNAME, "ssid", ssid, "--"]
+    if key_mgmt:
+        args += ["802-11-wireless-security.key-mgmt", key_mgmt]
+        if psk:
+            args += ["802-11-wireless-security.psk", psk]
+    if band:
+        args += ["802-11-wireless.band", band,
+                 "connection.autoconnect-priority", FIVE_GHZ_PRIORITY]
+    args += list(PROFILE_HARDENING)
+    nmcli(*args)
+
+    for profile in load_profiles():
+        if profile["name"] == name:
+            return profile["uuid"]
+    raise NmcliFailed(1, f"profile '{name}' was not found after adding it")
+
+
+def harden_profile(uuid):
+    """
+    Applies PROFILE_HARDENING to an existing profile. Idempotent, and safe on
+    the live connection: `nmcli connection modify` writes the profile without
+    reactivating the device, so it never drops the uplink by itself.
+    """
+    try:
+        nmcli("connection", "modify", uuid, *PROFILE_HARDENING)
+    except NmcliError as exc:
+        # Worth continuing: the join still works, it is just not hardened.
+        print(f"connect: WARNING could not apply profile hardening: {exc}")
+
+
 def unique_profile_name(ssid, profiles):
     """
     A profile named after the SSID, suffixed if that name is taken. NM allows
@@ -695,11 +865,17 @@ def unique_profile_name(ssid, profiles):
     profile called exactly that -- adding a second would be indistinguishable.
     """
     taken = {p["name"] for p in profiles}
-    if ssid not in taken:
+    # Both names have to be free: the 5 GHz sibling is this name plus the
+    # suffix, and a collision there would make the pair indistinguishable too.
+    def free(candidate):
+        return (candidate not in taken
+                and candidate + FIVE_GHZ_SUFFIX not in taken)
+
+    if free(ssid):
         return ssid
     for suffix in range(2, 100):
         candidate = f"{ssid} {suffix}"
-        if candidate not in taken:
+        if free(candidate):
             return candidate
     return f"{ssid} {int(time.time())}"
 
@@ -709,7 +885,8 @@ def do_connect(ssid, psk, job_id):
     Runs in its own thread. Holds _MUTATE_LOCK for its whole life; the caller
     acquired it, this releases it.
     """
-    added_uuid = ""
+    added_uuids = []
+    five_ghz_uuid = ""
     previous_uuid = active_wifi_uuid()
     try:
         profiles = PROFILES_CACHE.get(force=True)[0]
@@ -719,38 +896,60 @@ def do_connect(ssid, psk, job_id):
             # Saved credential: just bring it up.
             target_uuid = existing["uuid"]
             set_job(phase="activating saved profile")
+            harden_profile(target_uuid)
         elif existing and psk:
             # Replacing the stored password. Irreversible: the old PSK cannot
             # be read back, so the UI warns before getting here.
             target_uuid = existing["uuid"]
             set_job(phase="updating saved password")
             km = existing["key_mgmt"] or key_mgmt_for(ssid, psk) or "wpa-psk"
-            nmcli("connection", "modify", target_uuid,
-                  "802-11-wireless-security.key-mgmt", km,
-                  "802-11-wireless-security.psk", psk)
+            # Every profile for this SSID, not just the preferred one: a band
+            # pair shares one password, and leaving the sibling on the old PSK
+            # turns the fallback into an auth_failed later, far from the cause.
+            for sibling in profiles_for_ssid(profiles, ssid):
+                nmcli("connection", "modify", sibling["uuid"],
+                      "802-11-wireless-security.key-mgmt", km,
+                      "802-11-wireless-security.psk", psk)
+                harden_profile(sibling["uuid"])
         else:
             set_job(phase="creating profile")
             name = unique_profile_name(ssid, profiles)
             km = key_mgmt_for(ssid, psk)
-            args = ["connection", "add", "type", "wifi", "con-name", name,
-                    "ifname", IFNAME, "ssid", ssid]
-            if km:
-                args += ["--", "802-11-wireless-security.key-mgmt", km]
-                if psk:
-                    args += ["802-11-wireless-security.psk", psk]
-            nmcli(*args)
-            target_uuid = ""
-            for profile in load_profiles():
-                if profile["name"] == name:
-                    target_uuid = profile["uuid"]
-                    break
-            if not target_uuid:
-                raise NmcliFailed(1, f"profile '{name}' was not found after adding it")
-            added_uuid = target_uuid
+            # The unlocked profile first: it is the one that works everywhere,
+            # so it is also the fallback if the 5 GHz lock finds no BSS.
+            target_uuid = add_profile(name, ssid, km, psk)
+            added_uuids.append(target_uuid)
+            if ssid_has_5ghz(ssid):
+                five_name = name + FIVE_GHZ_SUFFIX
+                try:
+                    five_ghz_uuid = add_profile(five_name, ssid, km, psk, band="a")
+                except NmcliError as exc:
+                    # Not fatal: without it the join just loses the band
+                    # preference, which is a slow link, not a broken one.
+                    print(f"connect: WARNING could not add {five_name!r}: {exc}")
+                else:
+                    added_uuids.append(five_ghz_uuid)
+                    target_uuid = five_ghz_uuid
 
         set_job(phase="associating")
         # -w blocks until NM finishes, so stderr carries the real reason.
-        nmcli("-w", "50", "connection", "up", "uuid", target_uuid, timeout=60)
+        try:
+            nmcli("-w", "50", "connection", "up", "uuid", target_uuid, timeout=60)
+        except NmcliError as exc:
+            # A band-locked profile fails outright where that band has no BSS,
+            # and the scan that said "dual-band" can be seconds stale. Retry on
+            # the unlocked profile instead of reporting a failure the user can
+            # do nothing about. Only for no_ap: a rejected password would just
+            # fail twice and cost another 50 s.
+            stderr = getattr(exc, "stderr", "") or str(exc)
+            fallback = added_uuids[0] if (five_ghz_uuid
+                                          and target_uuid == five_ghz_uuid) else ""
+            if not fallback or classify_activation_failure(stderr)[0] != "no_ap":
+                raise
+            print("connect: no 5 GHz BSS; falling back to the unlocked profile")
+            set_job(phase="associating (no 5 GHz; any band)")
+            target_uuid = fallback
+            nmcli("-w", "50", "connection", "up", "uuid", target_uuid, timeout=60)
 
         state = nmcli_props(target_uuid, "connection.id").get("connection.id", "")
         ip = ""
@@ -767,18 +966,18 @@ def do_connect(ssid, psk, job_id):
         code, message = classify_activation_failure(stderr)
         print(f"connect: failed for {ssid!r}: {code}: {message}")
 
-        # A profile created for this attempt must not survive it, or a typo
+        # Profiles created for this attempt must not survive it, or a typo
         # permanently adds a bogus "saved" network.
-        if added_uuid:
+        for uuid in added_uuids:
             try:
-                nmcli("connection", "delete", "uuid", added_uuid)
-                print(f"connect: removed the profile added for this attempt")
+                nmcli("connection", "delete", "uuid", uuid)
+                print("connect: removed a profile added for this attempt")
             except NmcliError as cleanup_exc:
                 print(f"connect: WARNING could not remove added profile: {cleanup_exc}")
 
         # Put the uplink back if we moved off it.
         rolled_back = False
-        if previous_uuid and previous_uuid != added_uuid:
+        if previous_uuid and previous_uuid not in added_uuids:
             try:
                 nmcli("-w", "40", "connection", "up", "uuid", previous_uuid,
                       timeout=50)
@@ -859,43 +1058,52 @@ def handle_forget(body):
             # Refusing protects the usb0 (802-3-ethernet) and lo profiles.
             return 404, {"ok": False, "error": "not_found",
                          "message": "no such saved WiFi profile"}
+        targets = [target]
     else:
-        matches = [p for p in profiles if p["ssid"] == ssid]
-        if not matches:
+        # By SSID: every profile for it. "Forget this network" has to mean the
+        # whole set -- this API creates a band pair, and deleting only the
+        # preferred profile would leave the sibling to autoconnect, so the
+        # network would still look saved and still be joined. Earlier versions
+        # returned 409 "ambiguous" here, which made the pair unforgettable
+        # from the picker.
+        targets = profiles_for_ssid(profiles, ssid)
+        if not targets:
             return 404, {"ok": False, "error": "not_found",
                          "message": f"no saved profile for {ssid!r}"}
-        if len(matches) > 1:
-            return 409, {"ok": False, "error": "ambiguous",
-                         "message": (f"{ssid!r} has {len(matches)} saved profiles; "
-                                     "pass the uuid of the one to delete"),
-                         "candidates": [{"uuid": m["uuid"], "name": m["name"]}
-                                        for m in matches]}
-        target = matches[0]
 
-    if target["active"] and not force:
+    active = [t for t in targets if t["active"]]
+    if active and not force:
         return 409, {"ok": False, "error": "active",
-                     "message": (f"{target['name']!r} is the network currently "
+                     "message": (f"{active[0]['name']!r} is the network currently "
                                  "providing the connection; pass force to delete it "
                                  "anyway, which will disconnect the RV"),
-                     "profile": {"uuid": target["uuid"], "name": target["name"]}}
+                     "profile": {"uuid": active[0]["uuid"], "name": active[0]["name"]}}
 
     if not _MUTATE_LOCK.acquire(blocking=False):
         return 409, {"ok": False, "error": "busy",
                      "message": "another WiFi operation is already running",
                      "operation": job_snapshot()}
+    deleted = []
     try:
-        nmcli("connection", "delete", "uuid", target["uuid"])
-        print(f"forget: deleted profile {target['name']!r} (ssid {target['ssid']!r})")
+        # The active profile last, so that dropping the link cannot leave the
+        # siblings behind to autoconnect to the network just forgotten.
+        for target in sorted(targets, key=lambda t: t["active"]):
+            nmcli("connection", "delete", "uuid", target["uuid"])
+            print(f"forget: deleted profile {target['name']!r} (ssid {target['ssid']!r})")
+            deleted.append({"uuid": target["uuid"], "name": target["name"],
+                            "ssid": target["ssid"]})
     except NmcliError as exc:
-        return 502, {"ok": False, "error": "nm_failed", "message": str(exc)}
+        return 502, {"ok": False, "error": "nm_failed", "message": str(exc),
+                     "deleted_profiles": deleted}
     finally:
         PROFILES_CACHE.invalidate()
         NETWORKS_CACHE.invalidate()
         _MUTATE_LOCK.release()
 
-    return 200, {"ok": True, "deleted": {"uuid": target["uuid"],
-                                         "name": target["name"],
-                                         "ssid": target["ssid"]}}
+    # "deleted" stays a single object for the dashboard, which reports
+    # deleted.name; the full set is alongside it.
+    return 200, {"ok": True, "deleted": deleted[-1],
+                 "deleted_profiles": deleted}
 
 
 # ---------------------------------------------------------------------------

@@ -1,31 +1,31 @@
 #!/bin/bash
 #
-# Installs the WiFi bridge services on the Pi Zero 2W.
+# Installs the WiFi API service, on either host that can run it.
 #
-# Usage (run ON the Zero, with sudo):
-#   sudo ./setup_services.sh listener   # the legacy socket listener (port 12345)
-#   sudo ./setup_services.sh api        # the HTTP JSON API (port 12346)
-#   sudo ./setup_services.sh both       # both (default)
+# Usage (run ON the target host, with sudo):
+#   sudo ./setup_services.sh rp5     # the RP5 "Sophie" + Alfa adapter (wlan1)
+#   sudo ./setup_services.sh zero    # the Pi Zero 2W bridge (wlan0)  [legacy]
 #
-# The two services use different ports and can run side by side; that is how
-# the cutover is meant to happen. Restarting either one does NOT disturb the
-# uplink -- NetworkManager owns wlan0 independently of these processes, and
-# usb0 is static and NM-unmanaged, so the RP5 never loses contact with the Zero.
+# Both install the same rpzero_wifi_api.py; the unit's Environment= block is
+# the whole difference. The RP5 deployment replaces the Zero -- run one or the
+# other, and point the dashboard's WIFI_BRIDGE_HOST at whichever is live
+# (127.0.0.1 for rp5, 10.10.0.1 for zero).
+#
+# Restarting the service does NOT disturb the uplink: NetworkManager owns the
+# radio independently of this process.
 
 set -u
 
 SCRIPT_DEST_DIR="/usr/local/sbin"
 SYSTEMD_DEST="/etc/systemd/system"
 
-LISTENER_SCRIPT="RPZero2WListener.py"
-LISTENER_UNIT="wifi-bridge-listener.service"
 API_SCRIPT="rpzero_wifi_api.py"
-API_UNIT="wifi-bridge-api.service"
 
-MODE="${1:-both}"
+MODE="${1:-}"
 case "$MODE" in
-  listener|api|both) ;;
-  *) echo "Usage: sudo $0 [listener|api|both]" >&2; exit 2 ;;
+  rp5)  UNIT="wifi-api-rp5.service";     CHECK_HOST="127.0.0.1" ;;
+  zero) UNIT="wifi-bridge-api.service";  CHECK_HOST="10.10.0.1" ;;
+  *) echo "Usage: sudo $0 rp5|zero" >&2; exit 2 ;;
 esac
 
 if [ "$(id -u)" -ne 0 ]; then
@@ -33,7 +33,17 @@ if [ "$(id -u)" -ne 0 ]; then
   exit 1
 fi
 
-# install_service <script> <unit>
+# The two units would both serve port 12346 and both drive nmcli. Running them
+# together means two services fighting over one NetworkManager.
+OTHER_UNIT="wifi-bridge-api.service"
+[ "$MODE" = zero ] && OTHER_UNIT="wifi-api-rp5.service"
+if systemctl is-enabled --quiet "$OTHER_UNIT" 2>/dev/null || \
+   systemctl is-active --quiet "$OTHER_UNIT" 2>/dev/null; then
+  echo "Error: $OTHER_UNIT is installed on this host and would collide on port" >&2
+  echo "       12346. Run: sudo systemctl disable --now $OTHER_UNIT" >&2
+  exit 1
+fi
+
 install_service() {
   local script="$1" unit="$2"
 
@@ -74,25 +84,17 @@ install_service() {
   return 0
 }
 
-RC=0
-if [ "$MODE" = "listener" ] || [ "$MODE" = "both" ]; then
-  install_service "$LISTENER_SCRIPT" "$LISTENER_UNIT" || RC=1
-fi
-if [ "$MODE" = "api" ] || [ "$MODE" = "both" ]; then
-  install_service "$API_SCRIPT" "$API_UNIT" || RC=1
-fi
-
-if [ "$RC" -ne 0 ]; then
+if ! install_service "$API_SCRIPT" "$UNIT"; then
   echo ""
   echo "--- FAILED --- see the errors above. The previous script version, if"
-  echo "any, is at $SCRIPT_DEST_DIR/<script>.prev"
-  exit "$RC"
+  echo "any, is at $SCRIPT_DEST_DIR/$API_SCRIPT.prev"
+  exit 1
 fi
 
 echo ""
 echo "--- Done ---"
-echo "Verify from the RP5 (not from here):"
-echo "  curl -s http://10.10.0.1:12346/api/health"
-echo "  curl -s 'http://10.10.0.1:12346/api/networks?rescan=1'"
-echo "Logs:   journalctl -u $API_UNIT -f"
+echo "Verify:"
+echo "  curl -s http://$CHECK_HOST:12346/api/health"
+echo "  curl -s 'http://$CHECK_HOST:12346/api/networks?rescan=1'"
+echo "Logs:   journalctl -u $UNIT -f"
 exit 0

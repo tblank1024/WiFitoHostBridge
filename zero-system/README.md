@@ -1,8 +1,16 @@
 # Zero (`RP2W`) system configuration — captured reference
 
 These files are copies of configuration that lives **only on the Zero's SD card** and was in no
-repository. They are the rest of the bridge: without them, `RPZero2WListener.py` has nothing to
-listen on. Captured 2026-10-06 from `RP2W`.
+repository. They are the rest of the bridge: without them, the API has no `10.10.0.1` to bind and
+the RP5 has no lease or route. Captured 2026-10-06 from `RP2W`.
+
+**The Zero has been retired** in favour of the Alfa adapter on the RP5
+(`rv/plan_new_WAN_WiFi.md`). The socket listener it hosted was deleted from this repo on
+2026-10-18 (`plan_wifi.md` Phase 5), and the Zero was **physically disconnected from Sophie the
+same day** — there is no `usb0` and `10.10.0.1` does not answer.
+
+These files still describe what is on the Zero's SD card, unchanged, so they are the recipe for
+reviving it. Keep them: nothing else records this configuration.
 
 They are **reference copies, not a deployment source** — nothing here is installed by
 `setup_services.sh`. Re-capture after changing anything on the Zero.
@@ -57,8 +65,10 @@ Remove with `ssh -t zero 'sudo rm /etc/systemd/system/host-bridge.service && sud
 daemon-reload'`.
 
 **3. `usb0-up.service` ordering is implicit.** It is `After=network.target` only, and nothing
-orders the listener after it. `wifi-bridge-listener.service` binds `10.10.0.1` and survives an
-early start only because `Restart=on-failure` retries. New services that bind `10.10.0.1` should
-declare `After=usb0-up.service` / `Wants=usb0-up.service` explicitly. Note also that
+orders the services that depend on its address after it. Anything binding `10.10.0.1` should
+declare `After=usb0-up.service` / `Wants=usb0-up.service` explicitly — `wifi-bridge-api.service`
+does, and also retries the bind for 60 s on its own, so an ordering surprise degrades to a slow
+start rather than a failed one. (The now-deleted listener survived an early start only by luck of
+`Restart=on-failure`.) Note also that
 `ExecStart=/sbin/ip addr add ...` fails if the address already exists, so a restart of this oneshot
 reports failure even though the interface is fine.
