@@ -55,9 +55,14 @@ Done, on hardware:
   because the Zero's `wlan0` faces a foreign network. On the RP5, `br0` carries RV guest devices,
   so a root API reachable from `br0` lets any RV WiFi client reconfigure the uplink.
 
-Still open: the antenna/outside mount, moving the adapter onto the hub (it is on a direct RP5 USB
-port today, and the Pi 5's 600 mA total USB cap applies — see the plan's issue 6), captive-portal
-handling in `pi5connect.sh`, and `plan_firewall.md`.
+- **The adapter belongs on a direct RP5 port, not on the hub** (decided 2026-10-18). It works on
+  the Plugable — it probed fine in socket 1 and ran `wlan1` — but see the `-110` trap below: one
+  hub re-enumeration killed it and nothing retried. Keeping WiFi outside the hub makes it an
+  out-of-band fallback for every other uplink, which all go *onto* the hub. The cost is that it
+  can no longer be power-gated by socket; use `ip link set wlan1 down` instead.
+
+Still open: the antenna/outside mount, captive-portal handling in `pi5connect.sh`, and
+`plan_firewall.md`.
 
 - **Uplink selection already exists: `/usr/local/sbin/pi5connect.sh`** (repo: `rv/raspap/pi5connect.sh`),
   run by `/etc/NetworkManager/dispatcher.d/99-pi5connect` on every interface up/down/connectivity-change
@@ -97,14 +102,36 @@ handling in `pi5connect.sh`, and `plan_firewall.md`.
   and Oct 13 it landed on **192.168.0.0/24** while the house LAN is **192.168.2.0/24** (a laptop on the
   same wall port gets 192.168.2.x), and v2.0 of pi5connect committed to it without checking. Open
   question: what device serves 192.168.0.0/24 — most likely Starlink, which shares that adapter.
+- **The Alfa's driver can fail to re-attach after a hub re-enumeration, silently.** Measured
+  2026-10-18: the Plugable dropped and came back (every device under `3-1`/`4-1` disconnected at
+  once), and on the second attempt the adapter logged
+  `mt76x2u 4-1.3.3:1.0: ASIC revision: 76120044` followed by
+  `probe with driver mt76x2u failed with error -110`. `-110` is `-ETIMEDOUT` — it read the ASIC
+  ID over control transfers, then timed out uploading firmware. The device stays enumerated with
+  **no driver bound and no `wlan1`**, nothing in the kernel retries, and there is no log line
+  after the failure. `pi5connect` failed over to `eth1` within 90 s, which is the only reason the
+  session survived. Recovery without touching anything else on the bus:
+  ```bash
+  echo 0 | sudo tee /sys/bus/usb/devices/<path>/authorized >/dev/null
+  echo 1 | sudo tee /sys/bus/usb/devices/<path>/authorized >/dev/null
+  ```
+  This is rung 3 of `rv/raspap/wan_revert.sh`. It is also the argument for keeping WiFi off the
+  hub: that one re-enumeration would otherwise have taken every uplink at the same moment.
 - **Only one WAN source is normally enumerated, so the interface name does not identify the WAN
   type** — don't key policy on it. The four are WiFi (now the Alfa on `wlan1`), cellular, Starlink
   and wired. ~~Starlink and wired share one USB-ethernet adapter.~~ **Corrected by the user
   2026-10-18: Starlink and wired are two separate adapters on two separate USB ports.** The
   2026-10-17 sweep inferred a shared adapter from finding nothing on Coolgear port 4 — but port 4
   is where the FT232R control chip lives, so "nothing attached" never implied "shared". On the
-  Plugable each WAN source has its own socket (`/etc/usbhub/sockets.json`, roles 1=wifi, 2=wired,
-  3=cell, 4=starlink).
+  Plugable each WAN source has its own socket (`/etc/usbhub/sockets.json`, roles 2=wired, 3=cell,
+  4=starlink; WiFi is not on the hub).
+  **Which Coolgear port is which is still unsettled, and don't spend time on it.** Measured
+  2026-10-18: port 3 (`1-2.3`, `r8152`) was the live WAN with `192.168.2.197` from the house LAN,
+  i.e. *wired*. The 2026-10-17 sweep found Starlink on that same port (`206.214.239.194`,
+  `192.168.100.1` answering) and recorded no MAC, so either the adapter or just its cable moved
+  between the two dates. `EXTENDED_CONNECTION_MAPPING` in `server.py` has both `starlink` and
+  `wired` on port 3, so one entry is wrong — but the table dies with the Coolgear and
+  `/api/hub/wan` selects by role, so it is not worth a guess.
 
 ## Known hardware failure: the Coolgear hub's control chip
 
@@ -151,8 +178,12 @@ Established by direct comparison; see `Results_WiFi_testing.md` for the evidence
   `/run/pi5connect-wan` and `ip route` for which interface that is right now — it has been `usb0`
   (via the Zero), `eth1` (wired) and could be `wlan1`. Anything that reconnects *that* interface
   (`nmcli con up/down`, `dev reapply`, BSSID lock, a reboot, `dtoverlay`) kills the session; hand
-  those to the user, and prefer a **timed auto-revert** so a mistake restores itself:
-  `sudo systemd-run --unit=netrevert --on-active=5min <restore command>`.
+  those to the user, and prefer a **timed auto-revert** so a mistake restores itself. For WAN
+  rewiring there is now a purpose-built one — `rv/raspap/wan_revert.sh arm <minutes>` — which
+  snapshots the working state and runs a six-rung recovery ladder (pi5connect, power on every hub
+  socket, re-authorize a stalled MT7612U, a saved WiFi profile, `nmcli device connect` for a
+  wired adapter that landed on a new name, then `PI5_FORCE=1`). For anything else, the generic
+  form is `sudo systemd-run --unit=netrevert --on-active=5min <restore command>`.
   `iw ... set power_save` and `nmcli con modify` (without reactivating) are safe.
   When adding a new uplink, give it a **higher** `ipv4.route-metric` than the live one so it cannot
   steal the default route, test it interface-bound (`curl --interface`, `ping -I`), and only then
