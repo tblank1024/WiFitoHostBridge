@@ -97,9 +97,14 @@ handling in `pi5connect.sh`, and `plan_firewall.md`.
   and Oct 13 it landed on **192.168.0.0/24** while the house LAN is **192.168.2.0/24** (a laptop on the
   same wall port gets 192.168.2.x), and v2.0 of pi5connect committed to it without checking. Open
   question: what device serves 192.168.0.0/24 — most likely Starlink, which shares that adapter.
-- **The 4 WAN sources share one USB switch port into the RP5, so only one is normally enumerated.**
-  WiFi (via the Zero), cellular, Starlink and wired; Starlink and wired share one USB-ethernet adapter.
-  Because of that, the interface name does not identify the WAN type — don't key policy on it.
+- **Only one WAN source is normally enumerated, so the interface name does not identify the WAN
+  type** — don't key policy on it. The four are WiFi (now the Alfa on `wlan1`), cellular, Starlink
+  and wired. ~~Starlink and wired share one USB-ethernet adapter.~~ **Corrected by the user
+  2026-10-18: Starlink and wired are two separate adapters on two separate USB ports.** The
+  2026-10-17 sweep inferred a shared adapter from finding nothing on Coolgear port 4 — but port 4
+  is where the FT232R control chip lives, so "nothing attached" never implied "shared". On the
+  Plugable each WAN source has its own socket (`/etc/usbhub/sockets.json`, roles 1=wifi, 2=wired,
+  3=cell, 4=starlink).
 
 ## Known hardware failure: the Coolgear hub's control chip
 

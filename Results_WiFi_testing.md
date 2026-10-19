@@ -262,8 +262,14 @@ normally powered; both control endpoints are exclusive
 
 **Hub port 4 holds the FT232R that controls the switch, and is always powered** —
 it stays attached while port 2 is the active WAN. So there are three switchable
-jacks, not four, which matches the hardware: Starlink and wired share one ethernet
-adapter (you move the RJ45).
+jacks on this hub, not four.
+
+~~which matches the hardware: Starlink and wired share one ethernet adapter (you
+move the RJ45).~~ **That inference was wrong — corrected by the user 2026-10-18:
+Starlink and wired are two separate adapters on two separate USB ports.** Port 4
+being empty is explained entirely by the FT232R sitting there; it said nothing
+about how many adapters exist. The wired adapter simply was not on this hub during
+the sweep. Don't re-derive the shared-adapter conclusion from this table.
 
 ### Root cause
 
