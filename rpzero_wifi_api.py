@@ -85,6 +85,11 @@ ALLOWED_NET = ip_network(os.environ.get("WIFI_API_ALLOWED_NET", "10.10.0.0/24"))
 # Floor between real rescans, however often the UI asks. A rescan while
 # NetworkManager is mid-association fights the association.
 SCAN_MIN_INTERVAL = float(os.environ.get("SCAN_MIN_INTERVAL", "10"))
+# How long an SSID is carried after a scan stops seeing it. See scan_merged():
+# a forced rescan routinely returns a THIN list, and carrying is what stops
+# that from emptying the picker. A network that has really gone drops out this
+# many seconds after it was last genuinely seen.
+SCAN_CARRY_SECONDS = float(os.environ.get("SCAN_CARRY_SECONDS", "90"))
 NMCLI_TIMEOUT = float(os.environ.get("NMCLI_TIMEOUT", "25"))
 STATUS_TTL = float(os.environ.get("STATUS_TTL", "1"))
 NETWORKS_TTL = float(os.environ.get("NETWORKS_TTL", "10"))
@@ -507,6 +512,88 @@ def pct_to_dbm(pct):
     return int(round(pct * 0.6 - 100))
 
 
+def dbm_to_pct(dbm):
+    """The inverse of pct_to_dbm, for BSSes only the kernel's dump carries."""
+    if dbm is None:
+        return 0
+    return max(0, min(100, int(round((dbm + 100) / 0.6))))
+
+
+def iw_scan_entries():
+    """
+    {BSSID: {ssid, dbm, freq, security}} from the kernel's cached scan results.
+
+    This exists because NetworkManager's BSS table lags the kernel's badly
+    after an idle gap. Measured 2026-10-26 on the Alfa, 330s idle, times
+    relative to a `nmcli device wifi rescan` that returned rc=0 in 0.03s
+    without waiting for anything:
+
+        before:  nmcli 1 SSID    iw dump  5 BSSes
+        +2s      nmcli 1 SSID    iw dump  9 BSSes
+        +5s      nmcli 1 SSID    iw dump 16 BSSes
+        +10s     nmcli 1 SSID    iw dump 24 BSSes
+        +15s     nmcli 8 SSIDs   iw dump 21 BSSes
+
+    So for fifteen seconds NM reports only the network already associated --
+    which is the whole of the dashboard's "no way to pick a different
+    network". The kernel knew about two dozen the entire time. scan() therefore
+    takes NM's list as authoritative for what it alone knows (security as NM
+    parsed it, IN-USE, saved profiles) and fills in the SSIDs only the kernel
+    has seen.
+
+    "scan dump" reads what the kernel already has and never triggers a scan,
+    so this costs nothing and cannot disturb the link.
+    """
+    try:
+        out = subprocess.run([IW, "dev", IFNAME, "scan", "dump"],
+                             capture_output=True, text=True, timeout=10).stdout
+    except (OSError, subprocess.SubprocessError) as exc:
+        print(f"warning: iw scan dump failed: {exc}")
+        return {}
+    entries, bssid = {}, ""
+    for line in out.splitlines():
+        match = re.match(r"^BSS ([0-9a-fA-F:]{17})", line)
+        if match:
+            bssid = match.group(1).upper()
+            entries[bssid] = {"ssid": None, "dbm": None, "freq": "",
+                              "privacy": False, "rsn": False, "wpa": False}
+            continue
+        if not bssid:
+            continue
+        entry = entries[bssid]
+        match = re.match(r"^\s+signal:\s*(-?[\d.]+) dBm", line)
+        if match:
+            entry["dbm"] = int(round(float(match.group(1))))
+            continue
+        match = re.match(r"^\s+freq:\s*(\d+)", line)
+        if match:
+            entry["freq"] = match.group(1)
+            continue
+        # "SSID: " with nothing after it is a hidden AP, which is why this
+        # keeps "" distinct from None (field absent).
+        match = re.match(r"^\s+SSID: ?(.*)$", line)
+        if match:
+            entry["ssid"] = match.group(1)
+            continue
+        if re.match(r"^\s+capability:.*\bPrivacy\b", line):
+            entry["privacy"] = True
+        elif re.match(r"^\s+RSN:", line):
+            entry["rsn"] = True
+        elif re.match(r"^\s+WPA:", line):
+            entry["wpa"] = True
+    # Collapse the IE flags into the vocabulary normalize_security() speaks.
+    for entry in entries.values():
+        if entry["rsn"]:
+            entry["security"] = "WPA2"
+        elif entry["wpa"]:
+            entry["security"] = "WPA1"
+        elif entry["privacy"]:
+            entry["security"] = "WEP"
+        else:
+            entry["security"] = ""
+    return entries
+
+
 def iw_scan_dbm():
     """
     {BSSID: dBm} from the kernel's cached scan results.
@@ -522,23 +609,9 @@ def iw_scan_dbm():
     this is the kernel's latest scan for this wdev while nmcli aggregates NM's
     longer-lived BSS table, so some BSSes nmcli lists are absent here.
     """
-    try:
-        out = subprocess.run([IW, "dev", IFNAME, "scan", "dump"],
-                             capture_output=True, text=True, timeout=10).stdout
-    except (OSError, subprocess.SubprocessError) as exc:
-        print(f"warning: iw scan dump failed: {exc}")
-        return {}
-    levels = {}
-    bssid = ""
-    for line in out.splitlines():
-        match = re.match(r"^BSS ([0-9a-fA-F:]{17})", line)
-        if match:
-            bssid = match.group(1).upper()
-            continue
-        match = re.match(r"^\s+signal:\s*(-?[\d.]+) dBm", line)
-        if match and bssid:
-            levels[bssid] = int(round(float(match.group(1))))
-    return levels
+    return {bssid: entry["dbm"]
+            for bssid, entry in iw_scan_entries().items()
+            if entry["dbm"] is not None}
 
 
 def iw_link_dbm():
@@ -560,6 +633,32 @@ def iw_link_dbm():
     return int(round(float(match.group(1)))) if match else None
 
 
+def request_rescan():
+    """
+    Ask NetworkManager for a real scan, as its own command.
+
+    `nmcli device wifi list --rescan yes` cannot be trusted to do this: it
+    returns as soon as it has *a* list, which intermittently means NM's BSS
+    list before the scan results land. NM also ages BSSes out after roughly
+    half a minute, and the associated BSS never ages out -- so after an idle
+    gap that premature list is exactly one network, the one already joined.
+    Measured on the Alfa 2026-10-26: four `--rescan yes` calls in a row
+    returned 1, 1, 17, 17 BSSes, and a `/api/wifi/networks?rescan=1` after a
+    few idle minutes returned a single SSID.
+
+    `nmcli device wifi rescan` is the synchronous form and does not return
+    until the scan is done: triggering it and then reading with `--rescan no`
+    gave the full 10-13 SSIDs on every attempt. A refusal ("Scanning not
+    allowed immediately following previous scan") is benign -- it means a
+    fresh scan already happened, which is what was wanted.
+    """
+    try:
+        nmcli("device", "wifi", "rescan", "ifname", IFNAME)
+        return True, ""
+    except NmcliError as exc:
+        return False, str(exc)
+
+
 def scan(rescan=False):
     """
     Visible networks, one entry per SSID.
@@ -573,7 +672,11 @@ def scan(rescan=False):
     "iw scan dump" per BSSID. The percentage is kept: it is what the signal
     bars render from, and it is present even when iw has no entry for a BSS.
     """
-    dbm_by_bssid = iw_scan_dbm()
+    if rescan:
+        request_rescan()
+    iw_entries = iw_scan_entries()
+    dbm_by_bssid = {b: e["dbm"] for b, e in iw_entries.items()
+                    if e["dbm"] is not None}
     profiles = PROFILES_CACHE.get()[0]
     index = index_by_ssid(profiles)
     counts = count_by_ssid(profiles)
@@ -584,7 +687,9 @@ def scan(rescan=False):
         # Pin the interface. Both hosts carry a p2p-dev-<ifname> alongside the
         # real one, and on the RP5 wlan0 is the RV's own AP radio.
         "ifname", IFNAME,
-        "--rescan", "yes" if rescan else "no",
+        # Always "no": request_rescan() above has already waited for the real
+        # scan, and "yes" here is what returned a premature list.
+        "--rescan", "no",
     )
 
     merged = {}
@@ -668,6 +773,44 @@ def scan(rescan=False):
             entry["joinable"] = joinable
             entry["unjoinable_reason"] = reason
 
+    # SSIDs the kernel has seen but NM has not caught up on. NM's entries are
+    # left exactly as they are -- this only ADDS -- so nothing here can
+    # override NM's security parsing or its idea of what is in use.
+    for bssid, entry in iw_entries.items():
+        ssid = entry["ssid"]
+        if not ssid or ssid in merged:
+            continue          # hidden, or NM already has it
+        label, joinable, reason = normalize_security(entry["security"])
+        profile = index.get(ssid)
+        blocked = "self" if ssid == SELF_AP_SSID else ""
+        if blocked:
+            joinable = False
+            reason = "this RV's own network"
+        freq = f"{entry['freq']} MHz" if entry["freq"] else ""
+        merged[ssid] = {
+            "ssid": ssid,
+            "signal": dbm_to_pct(entry["dbm"]),
+            "security": label,
+            "joinable": joinable,
+            "unjoinable_reason": reason,
+            "blocked": blocked,
+            # The associated BSS is always in NM's list, so anything only the
+            # kernel has cannot be the live one.
+            "in_use": False,
+            "saved": profile is not None,
+            "has_psk": bool(profile and profile["has_psk"]),
+            "profile": profile["name"] if profile else "",
+            "profile_uuid": profile["uuid"] if profile else "",
+            "profile_count": counts.get(ssid, 0),
+            "bssid_count": 1,
+            "freq": freq,
+            "_bands": {band_of(freq)} - {""},
+            "_in_use_freq": "",
+            "_in_use_signal": 0,
+            "_dbm": entry["dbm"],
+            "_in_use_dbm": None,
+        }
+
     networks = list(merged.values())
     for network in networks:
         bands = sorted(network.pop("_bands"))
@@ -689,6 +832,75 @@ def scan(rescan=False):
     networks.sort(key=lambda n: (not n["in_use"], not n["saved"],
                                  -n["signal"], n["ssid"].casefold()))
     return networks
+
+
+# A scan must never shrink the list on its own.
+#
+# Measured on the Alfa (wlan1) 2026-10-26: four `nmcli --rescan yes` calls in a
+# row returned 1, 1, 17, 17 BSSes. The first two came back while the scan was
+# still running, carrying only the BSS already associated -- and the old code
+# wrote that straight into NETWORKS_CACHE as authoritative, so for the next
+# NETWORKS_TTL the picker offered exactly one network: the one already joined.
+# The UI force-rescans once on mount, so a page load landed on that path
+# routinely. That is the whole of the reported "there is no way to pick a
+# different network" -- the list was empty, not unclickable.
+#
+# So: fresh results win, and an SSID the previous scan saw is carried until
+# SCAN_CARRY_SECONDS has passed since it was last REALLY seen. The last-seen
+# stamp is per SSID and is only refreshed by a fresh sighting, so carrying
+# cannot renew itself -- a network that has gone drops out on schedule.
+_seen_lock = threading.Lock()
+_seen_at = {}        # ssid -> time.monotonic() when last seen in a real scan
+_last_merged = []    # the list handed out last time, carried entries included
+
+
+# A scan that finds only the network already joined has almost certainly not
+# landed yet, rather than the RV being somewhere with exactly one AP in range.
+# The pause is sized from the measurement in iw_scan_entries(): the kernel
+# needs about ten seconds to walk every channel, so re-reading at two-second
+# intervals (the first attempt at this) just read the same stale list three
+# times. Each retry re-requests, because a request is what makes the kernel
+# scan at all.
+THIN_SCAN_RETRIES = 2
+THIN_SCAN_PAUSE = 6.0
+
+
+def scan_merged(rescan=False):
+    """scan(), but never losing an SSID a recent scan saw. See the note above."""
+    global _last_merged
+    fresh = scan(rescan=rescan)
+    for _ in range(THIN_SCAN_RETRIES if rescan else 0):
+        if len(fresh) > 1:
+            break
+        time.sleep(THIN_SCAN_PAUSE)
+        fresh = scan(rescan=True)
+    now = time.monotonic()
+    for network in fresh:
+        network["stale"] = False
+    with _seen_lock:
+        for network in fresh:
+            _seen_at[network["ssid"]] = now
+        present = {network["ssid"] for network in fresh}
+        for old in _last_merged:
+            ssid = old["ssid"]
+            if ssid in present:
+                continue
+            if now - _seen_at.get(ssid, 0.0) >= SCAN_CARRY_SECONDS:
+                continue
+            # Carried, not re-measured: whatever it said about the live
+            # association cannot still be true, since the associated BSS is
+            # always in a real scan's output.
+            fresh.append(dict(old, stale=True, in_use=False,
+                              in_use_band="", in_use_signal=0))
+        for ssid in [s for s, t in _seen_at.items()
+                     if now - t >= SCAN_CARRY_SECONDS and s not in present]:
+            del _seen_at[ssid]
+        # Carried entries sort below fresh ones of the same standing, so the
+        # top of the picker is always something just seen.
+        fresh.sort(key=lambda n: (not n["in_use"], n["stale"], not n["saved"],
+                                  -n["signal"], n["ssid"].casefold()))
+        _last_merged = fresh
+    return fresh
 
 
 # ---------------------------------------------------------------------------
@@ -822,7 +1034,7 @@ def load_status():
 
 
 PROFILES_CACHE = Cache(PROFILES_TTL, load_profiles)
-NETWORKS_CACHE = Cache(NETWORKS_TTL, lambda: scan(rescan=False))
+NETWORKS_CACHE = Cache(NETWORKS_TTL, lambda: scan_merged(rescan=False))
 STATUS_CACHE = Cache(STATUS_TTL, load_status)
 
 
@@ -833,7 +1045,7 @@ def networks_payload(want_rescan):
     """
     if want_rescan and rescan_allowed():
         with NETWORKS_CACHE.lock:
-            NETWORKS_CACHE.value = scan(rescan=True)
+            NETWORKS_CACHE.value = scan_merged(rescan=True)
             NETWORKS_CACHE.stamp = time.monotonic()
         networks, age = NETWORKS_CACHE.value, 0.0
         rescanned = True
