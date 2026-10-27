@@ -64,9 +64,11 @@ has accumulated — a long-lived service never gets there.
 import json
 import os
 import re
+import socket
 import subprocess
 import threading
 import time
+import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from ipaddress import ip_address, ip_network
 from urllib.parse import urlparse, parse_qs
@@ -1562,6 +1564,75 @@ class Handler(BaseHTTPRequestHandler):
         self._send(status, payload)
 
 
+
+# ---------------------------------------------------------------------------
+# systemd watchdog
+# ---------------------------------------------------------------------------
+# WatchdogSec in the unit makes systemd kill and restart this service if it
+# stops pinging. Restart=always already covers the process EXITING, so the
+# watchdog's entire added value is catching a HANG -- which means the ping has
+# to prove the HTTP loop is still serving, not merely that a timer thread is
+# alive. A bare timer would keep pinging straight through a deadlocked
+# serve_forever(), i.e. through exactly the failure it exists to catch.
+#
+# That is not hypothetical here: this service shells out to nmcli, and a
+# wedged nmcli is the realistic way for it to stop answering while the process
+# stays up.
+#
+# Interval is WatchdogSec/3, so three consecutive failed self-checks are
+# needed before systemd acts -- one slow nmcli does not restart the service.
+def _sd_notify(message):
+    """One datagram to systemd's notify socket. False if not under systemd."""
+    address = os.environ.get("NOTIFY_SOCKET")
+    if not address:
+        return False
+    if address.startswith("@"):          # abstract namespace
+        address = "\0" + address[1:]
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as sock:
+            sock.connect(address)
+            sock.sendall(message.encode())
+        return True
+    except OSError as exc:
+        print(f"warning: sd_notify failed: {exc}")
+        return False
+
+
+def start_watchdog():
+    """Ping systemd only while this server can still answer its own request."""
+    usec = os.environ.get("WATCHDOG_USEC")
+    if not usec or not os.environ.get("NOTIFY_SOCKET"):
+        return None                      # not under systemd with WatchdogSec
+    try:
+        interval = max(5.0, (int(usec) / 1_000_000.0) / 3.0)
+    except ValueError:
+        return None
+
+    # 127.0.0.1 regardless of BIND_ADDR: the server also listens on loopback,
+    # and a self-check should not depend on br0 being up.
+    url = f"http://127.0.0.1:{BIND_PORT}/api/health"
+    # Own opener: the default one honours http_proxy from the environment,
+    # which would send a loopback self-check out through a proxy.
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+    def beat():
+        while True:
+            time.sleep(interval)
+            try:
+                with opener.open(url, timeout=max(2.0, interval / 2)) as response:
+                    healthy = response.status == 200
+            except Exception as exc:
+                healthy = False
+                print(f"watchdog: self-check failed, not pinging: {exc}")
+            if healthy:
+                _sd_notify("WATCHDOG=1")
+
+    thread = threading.Thread(target=beat, daemon=True, name="sd-watchdog")
+    thread.start()
+    print(f"watchdog: self-check every {interval:.0f}s against {url}")
+    return thread
+
+
 class Server(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
@@ -1616,6 +1687,7 @@ def serve():
     print(f"Listening on {BIND_ADDR}:{BIND_PORT} "
           f"(iface={IFNAME}, self-AP={SELF_AP_SSID!r}, allow={ALLOWED_NET})")
     try:
+        start_watchdog()
         httpd.serve_forever()
     except KeyboardInterrupt:
         print("interrupted; shutting down")
